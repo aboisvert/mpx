@@ -1,6 +1,11 @@
 import std/[posix, termios, selectors]
 import mpx/[protocol, config, pty]
 
+# Not exported by Nim's posix: Linux, macOS, and the BSDs all use 28.
+const SIGWINCH = cint(28)
+
+var winchFd: cint = -1  # socket fd for the SIGWINCH handler
+
 proc runClient*(sessionName: string, cfg: Config) =
   let fd =
     try:
@@ -15,7 +20,7 @@ proc runClient*(sessionName: string, cfg: Config) =
       for p in basePort ..< basePort + 64:
         try:
           let candidate = connectTcp(ip, p)
-          sendMsg(candidate, mkAttach, sessionName.toOpenArrayByte(0, sessionName.len-1))
+          discard sendMsg(candidate, mkAttach, sessionName.toOpenArrayByte(0, sessionName.len-1))
           let (kind, payload) = recvMsg(candidate)
           if kind == mkAttached:
             found = candidate
@@ -39,7 +44,10 @@ proc runClient*(sessionName: string, cfg: Config) =
   rawTermios.c_cc[VTIME] = 0.char
   discard tcsetattr(0, TCSADRAIN, addr rawTermios)
 
-  # Send terminal size
+  # Our terminal size is the session's size: claim it, and follow the
+  # local window with SIGWINCH for the life of the attach (the desk
+  # window resizing re-sizes the shared pty; a smaller co-attached
+  # viewer -- the phone -- deliberately does not).
   var win: Winsize
   discard ioctl(1, TIOCGWINSZ, addr win)
   var w = win.ws_col
@@ -47,7 +55,21 @@ proc runClient*(sessionName: string, cfg: Config) =
   if w == 0 or h == 0:
     w = 80
     h = 24
-  sendMsg(fd, mkResize, [byte(w shr 8), byte(w and 0xff), byte(h shr 8), byte(h and 0xff)])
+  discard sendMsg(fd, mkResize, [byte(w shr 8), byte(w and 0xff), byte(h shr 8), byte(h and 0xff)])
+
+  # Closure capture of `fd` is not allowed in a noconv signal handler; the
+  # socket fd is a stable integer for the life of the attach, so the
+  # handler reads it through a file-scope var instead.
+  winchFd = fd.cint
+  var oldWinch: typeof(SIG_IGN)
+  proc onWinch(sig: cint) {.noconv.} =
+    var ws: Winsize
+    discard ioctl(1, TIOCGWINSZ, addr ws)
+    if ws.ws_col > 0 and ws.ws_row > 0 and winchFd >= 0:
+      discard sendMsg(winchFd.SocketHandle, mkResize,
+        [byte(ws.ws_col shr 8), byte(ws.ws_col and 0xff),
+         byte(ws.ws_row shr 8), byte(ws.ws_row and 0xff)])
+  oldWinch = signal(SIGWINCH, onWinch)
 
   var sel = newSelector[SocketHandle]()
   sel.registerHandle(fd, {Event.Read}, fd)
@@ -72,10 +94,10 @@ proc runClient*(sessionName: string, cfg: Config) =
           # Ctrl+\ (0x1c) detaches; Ctrl+D passes through so the
           # contained program sees EOF and can exit
           if n == 1 and buf[0] == 0x1c:
-            sendMsg(fd, mkDetach)
+            discard sendMsg(fd, mkDetach)
             running = false
           else:
-            sendMsg(fd, mkInput, buf[0..<n])
+            discard sendMsg(fd, mkInput, buf[0..<n])
         else:
           running = false
       elif ev.fd == fd.cint:
@@ -100,8 +122,10 @@ proc runClient*(sessionName: string, cfg: Config) =
       let n = posix.read(0, addr buf[0], buf.len)
       discard fcntl(0, F_SETFL, fl)
       if n > 0:
-        sendMsg(fd, mkInput, buf[0..<n])
+        discard sendMsg(fd, mkInput, buf[0..<n])
 
   # Restore terminal
+  discard signal(SIGWINCH, oldWinch)
+  winchFd = -1
   discard tcsetattr(0, TCSADRAIN, addr oldTermios)
   discard posix.close(fd)

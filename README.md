@@ -143,9 +143,14 @@ The `%i` in the unit file is the session name. `mpx@main` = session "main".
 - **Clients** are dumb terminals. They send input, receive output.
 - **ttty** runs in parallel as a side cache. Only consulted on attach to render
   the current screen. Never in the data path.
-- **Concurrent clients** all see the same output. Only the first (controlling)
-  client can send input or resize.
-- **Resize** from the controlling client propagates to the PTY and to ttty.
+- **Concurrent clients** all see the same output, and every client can type
+  (primaryless: input fans in from whoever is attached; interleaving is the
+  humans' problem to coordinate).
+- **Resize** from any client propagates to the PTY and to ttty; last one
+  wins. Clients follow their local window with SIGWINCH while attached.
+- **Attach serves the full model**: the ttty side cache's scrollback (as
+  plain text) plus the live screen (with attributes), so a late joiner
+  starts with the session history in their own local scrollback.
 
 No terminal emulator is reimplemented. Ghostty keeps its scrollback, mouse,
 clipboard, font rendering. mpx is invisible.

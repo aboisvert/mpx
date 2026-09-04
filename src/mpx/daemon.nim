@@ -5,7 +5,6 @@ import ttty/[terminal, grid]
 type
   Client = object
     fd: SocketHandle
-    snapshotSent: bool
 
   Session = object
     name: string
@@ -47,25 +46,34 @@ proc broadcast(session: var Session, kind: MsgKind, payload: openArray[byte]) =
   while i < session.clients.len:
     let client = session.clients[i]
     try:
-      sendMsg(client.fd, kind, payload)
+      if not sendMsg(client.fd, kind, payload):
+        raise newException(IOError, "short write to client fd=" & $client.fd.cint)
       inc i
     except IOError:
       session.clients.delete(i)
 
+proc sendSnapshot(session: var Session, fd: SocketHandle) =
+  ## Full-model render: scrollback as text, then the live screen with
+  ## attributes, ending in clear+home so live output follows cleanly.
+  ## One payload, sent as a single mkOutput message.
+  let snap = session.term.grid.renderAnsiFull()
+  if snap.len > 0:
+    try:
+      if not sendMsg(fd, mkOutput, snap.toOpenArrayByte(0, snap.len-1)):
+        raise newException(IOError, "short write on snapshot to fd=" & $fd.cint)
+    except IOError:
+      discard
+
 proc handleClientMsg(session: var Session, fd: SocketHandle, kind: MsgKind, payload: seq[byte]) =
-  # Find client
-  var clientIdx = -1
-  for i, c in session.clients:
-    if c.fd == fd:
-      clientIdx = i
-      break
-  if clientIdx < 0: return
+  if not knownClient(session, fd): return
 
   case kind
   of mkInput:
-    discard session.pty.write(unsafeAddr payload[0], payload.len)
+    # Primaryless: every attached client writes to the pty.
+    if payload.len > 0:
+      discard session.pty.write(unsafeAddr payload[0], payload.len)
   of mkResize:
-    # Any client may resize; last one wins
+    # Any client may resize; last one wins.
     if payload.len >= 4:
       let w = (payload[0].uint16 shl 8) or payload[1].uint16
       let h = (payload[2].uint16 shl 8) or payload[3].uint16
@@ -73,11 +81,6 @@ proc handleClientMsg(session: var Session, fd: SocketHandle, kind: MsgKind, payl
       session.term.grid.resize(w.int, h.int)
       # Broadcast resize to all clients so they can adapt
       session.broadcast(mkResize, payload)
-    # Send snapshot to newly attached client on first resize
-    if not session.clients[clientIdx].snapshotSent:
-      let snap = session.term.grid.renderAnsi(session.term.grid.width, session.term.grid.height)
-      sendMsg(fd, mkOutput, snap.toOpenArrayByte(0, snap.len-1))
-      session.clients[clientIdx].snapshotSent = true
   of mkDetach:
     discard
   else:
@@ -151,6 +154,7 @@ proc runDaemon*(sessionName, cmd: string, cfg: Config) =
         if clientFd != SocketHandle(-1):
           session.clients.add(Client(fd: clientFd))
           sel.registerHandle(clientFd, {Event.Read}, clientFd)
+          session.sendSnapshot(clientFd)
           log.info "client attached fd=" & $clientFd.cint
       elif ev.fd == tcpFd.cint:
         # New TCP client: hold it until it names the right session
@@ -178,11 +182,13 @@ proc runDaemon*(sessionName, cmd: string, cfg: Config) =
             # Unvetted TCP client: check the session name
             if payload == session.name.toOpenArrayByte(0, session.name.len-1):
               session.clients.add(Client(fd: fd))
-              sendMsg(fd, mkAttached)
+              if not sendMsg(fd, mkAttached):
+                raise newException(IOError, "short write on mkAttached")
+              session.sendSnapshot(fd)
               log.info "client attached fd=" & $fd.cint & " (tcp)"
             else:
               let err = "no such session"
-              sendMsg(fd, mkError, err.toOpenArrayByte(0, err.len-1))
+              discard sendMsg(fd, mkError, err.toOpenArrayByte(0, err.len-1))
               dropClient(session, sel, fd)
           else:
             session.handleClientMsg(fd, kind, payload)

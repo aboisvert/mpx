@@ -13,13 +13,30 @@ type
     mkAttached = 6'u8 # daemon -> client: attach accepted
 
 const
-  ProtocolVersion = 1'u8
+  # v2: the payload length is a 32-bit big-endian field. v1's single length
+  # byte capped frames at 255 bytes, which a full-model attach snapshot
+  # (scrollback + screen) overflows immediately.
+  ProtocolVersion = 2'u8
+  HeaderSize = 6
 
-proc sendMsg*(fd: SocketHandle, kind: MsgKind, payload: openArray[byte] = []) =
-  var header = [ProtocolVersion, kind.byte, payload.len.byte]
-  discard posix.write(fd.cint, addr header[0], 3)
+proc sendMsg*(fd: SocketHandle, kind: MsgKind,
+             payload: openArray[byte] = []): bool =
+  ## Write one framed message. Returns false when the write came up short
+  ## (the peer is gone); callers decide whether that is fatal.
+  if payload.len > 0xFFFFFFF:
+    return false
+  var header: array[HeaderSize, byte]
+  header[0] = ProtocolVersion
+  header[1] = kind.byte
+  let n = payload.len.uint32
+  header[2] = byte(n shr 24)
+  header[3] = byte(n shr 16)
+  header[4] = byte(n shr 8)
+  header[5] = byte(n)
+  result = posix.write(fd.cint, addr header[0], HeaderSize) == HeaderSize
   if payload.len > 0:
-    discard posix.write(fd.cint, unsafeAddr payload[0], payload.len)
+    result = posix.write(fd.cint, unsafeAddr payload[0],
+                         payload.len) == payload.len
 
 proc readFull*(fd: SocketHandle, buf: pointer, n: int): bool =
   ## Read exactly n bytes. False on EOF or error before n bytes arrived.
@@ -32,13 +49,14 @@ proc readFull*(fd: SocketHandle, buf: pointer, n: int): bool =
   true
 
 proc recvMsg*(fd: SocketHandle): tuple[kind: MsgKind, payload: seq[byte]] =
-  var header: array[3, byte]
-  if not readFull(fd, addr header[0], 3):
+  var header: array[HeaderSize, byte]
+  if not readFull(fd, addr header[0], HeaderSize):
     raise newException(IOError, "short read on message header")
   if header[0] != ProtocolVersion:
     raise newException(IOError, "protocol version mismatch")
   result.kind = header[1].MsgKind
-  let plen = header[2].int
+  let plen = (header[2].int shl 24) or (header[3].int shl 16) or
+             (header[4].int shl 8) or header[5].int
   if plen > 0:
     result.payload.setLen(plen)
     if not readFull(fd, addr result.payload[0], plen):
