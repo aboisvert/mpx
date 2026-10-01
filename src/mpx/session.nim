@@ -1,4 +1,4 @@
-import std/[os, posix]
+import std/[os, posix, times, strutils]
 import protocol, runtime
 
 proc defaultName*(): string =
@@ -57,3 +57,32 @@ proc isActive*(sessionName: string): bool =
   copyMem(addr saddr.sun_path, pathCstr, pathCstr.len)
   result = connect(fd, cast[ptr SockAddr](addr saddr), sizeof(Sockaddr_un).SockLen) == 0
   discard posix.close(fd)
+
+proc oldestSession*(): string =
+  ## The session for `mpx attach` with no name: the one whose daemon
+  ## started first, by pid-file mtime. mtime has second resolution, so a
+  ## tie is broken by the recorded pid (started earlier usually means
+  ## lower pid). "" when no session answers.
+  let dir = mpxDir()
+  if not dirExists(dir):
+    return ""
+  var best = ""
+  var bestSec: int64 = high(int64)
+  var bestPid = high(int)
+  for (_, f) in walkDir(dir):
+    if not f.endsWith(".sock"):
+      continue
+    let name = f.extractFilename.changeFileExt("")
+    if not isActive(name):
+      continue
+    let sec =
+      try:
+        getLastModificationTime(f.changeFileExt("pid")).toUnix
+      except OSError:
+        continue  # no pid file: not a session mpx started
+    let pid = daemonPid(name)
+    if sec < bestSec or (sec == bestSec and pid < bestPid):
+      best = name
+      bestSec = sec
+      bestPid = pid
+  best

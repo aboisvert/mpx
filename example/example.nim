@@ -148,6 +148,62 @@ doAssert not sockExists(sigRt / "mpx" / "k9demo.sock"), "attach should remove st
 echo "example: attach cleans up after a SIGKILLed daemon verified"
 removeDir(sigRt)
 
+# The default action is `new`: bare `mpx` starts a session named after
+# the directory and attaches to it. Commands work by unambiguous prefix,
+# and `attach` with no name picks the oldest live session.
+let defRt = getTempDir() / "mpx_example_default"
+let defDir = getTempDir() / "mpx_example_defdir"
+proc defEnv(): string = "env XDG_RUNTIME_DIR=" & defRt
+removeDir(defRt)
+removeDir(defDir)
+createDir(defDir)
+
+# The spawned daemon outlives the client and must not hold the output
+# pipe open: send its inherited stdio to /dev/null
+let (bareOut, bareRc) = execCmdEx("(sleep 1) | timeout 5 " & defEnv() & " " & bin &
+                                  " > /dev/null 2>&1",
+                                  workingDir = defDir)
+doAssert bareRc == 0, "bare mpx failed: " & bareOut
+let (defLs, _) = execCmdEx(defEnv() & " " & bin & " l")
+doAssert "mpx_example_defdir" in defLs,
+         "bare mpx did not start a cwd-named session: " & defLs
+echo "example: bare mpx starts a session named after the cwd verified"
+
+# Seed the old session with distinctive output, then start a younger one
+let (seedOut, _) = execCmdEx("(echo 'echo OLDSESS'; sleep 1) | timeout 5 " &
+                            defEnv() & " " & bin & " at mpx_example_defdir")
+doAssert "OLDSESS" in seedOut, "could not seed the old session: " & seedOut
+discard startProcess(bin, args=["d", "youngdemo", "/bin/cat"],
+                     env={"XDG_RUNTIME_DIR": defRt}.newStringTable,
+                     options={poDaemon})
+discard waitForSession(defRt, "youngdemo")
+let (youngOut, _) = execCmdEx("(echo 'hello young'; sleep 1) | timeout 5 " &
+                             defEnv() & " " & bin & " at youngdemo")
+doAssert "hello young" in youngOut, "prefix attach to youngdemo failed: " & youngOut
+
+# No-name attach lands on the older session: its scrollback, not the
+# younger session's, comes back in the snapshot
+let (oldestOut, _) = execCmdEx("(sleep 1) | timeout 5 " & defEnv() & " " & bin & " at")
+doAssert "OLDSESS" in oldestOut, "no-name attach missed the oldest session: " & oldestOut
+doAssert "hello young" notin oldestOut,
+       "no-name attach went to the younger session: " & oldestOut
+echo "example: attach with no name picks the oldest session verified"
+
+# Prefixes drive kill too, and the sessions go away
+let (_, killOld) = execCmdEx(defEnv() & " " & bin & " ki mpx_example_defdir")
+let (_, killYoung) = execCmdEx(defEnv() & " " & bin & " ki youngdemo")
+doAssert killOld == 0 and killYoung == 0, "prefix kill failed"
+let (afterKill, _) = execCmdEx(defEnv() & " " & bin & " l")
+doAssert "youngdemo" notin afterKill and "mpx_example_defdir" notin afterKill
+echo "example: command prefixes verified"
+
+# No-name attach with nothing alive is a clean error
+let (noneOut, _) = execCmdEx("timeout 3 " & defEnv() & " " & bin & " at 2>&1")
+doAssert "no active sessions" in noneOut, "expected a clean no-sessions error: " & noneOut
+echo "example: attach with no live sessions errors cleanly verified"
+removeDir(defRt)
+removeDir(defDir)
+
 discard execCmd("pkill -f 'mpx daemon /bin/cat' 2>/dev/null")
 removeDir(workdir)
 

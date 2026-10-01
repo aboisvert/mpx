@@ -83,6 +83,30 @@ suite "cli":
     check toConfig(parseCliArgs(@["-l", "10.0.0.4:9000", "-p", "4534"])).listen == "10.0.0.4:4534"
     check toConfig(parseCliArgs(@["--log"])).log
 
+suite "command resolution":
+  test "unambiguous prefixes":
+    check matchModes("d") == @["daemon"]
+    check matchModes("da") == @["daemon"]
+    check matchModes("a") == @["attach"]
+    check matchModes("at") == @["attach"]
+    check matchModes("n") == @["new"]
+    check matchModes("ne") == @["new"]
+    check matchModes("l") == @["ls"]
+    check matchModes("k") == @["kill"]
+    check matchModes("ki") == @["kill"]
+
+  test "full names resolve to themselves":
+    for m in ["daemon", "attach", "new", "ls", "kill"]:
+      check matchModes(m) == @[m]
+
+  test "no match means the word is a new-argument, not a command":
+    check matchModes("htop").len == 0
+    check matchModes("work").len == 0
+    check matchModes("list").len == 0
+
+  test "empty prefix is ambiguous":
+    check matchModes("").len == 5
+
 suite "config":
   test "parseListen splits host and port":
     let (ip, port) = parseListen("10.0.0.4:4534")

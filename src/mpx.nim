@@ -6,11 +6,13 @@ const
 
   UsageText = """
 Usage:
-  mpx [options] daemon [session] [cmd]  # start daemon (default name: dir basename, ~ in homedir)
-  mpx [options] attach <session>        # attach to session
-  mpx [options] new [session] [cmd]     # daemon in background + attach
-  mpx ls                                # list sessions
-  mpx kill <session>                    # kill daemon and remove socket
+  mpx [options] [session] [cmd]        # default action: session in background + attach
+  mpx [options] daemon [session] [cmd]  # start daemon in foreground (name defaults to dir basename, ~ in homedir)
+  mpx [options] attach [session]       # attach to a session (default: oldest)
+  mpx ls                               # list sessions
+  mpx kill <session>                   # kill daemon and remove socket
+
+Any unambiguous command prefix works: mpx d, mpx at, mpx ne, mpx l, mpx ki.
 
 Options:
 """
@@ -63,12 +65,23 @@ proc main() =
     echo "mpx " & Version
     quit(0)
 
-  if opts.sessions.len < 1:
-    die("missing command. " & UsageHint)
+  # Commands resolve by unambiguous prefix. A word that matches no
+  # command at all starts a `new` with the word as its first argument,
+  # so `mpx htop` runs htop in a session and bare `mpx` starts a shell.
+  var mode = "new"
+  var rest: seq[string]
+  if opts.sessions.len > 0:
+    let matches = matchModes(opts.sessions[0])
+    if matches.len == 1:
+      mode = matches[0]
+      rest = opts.sessions[1 ..^ 1]
+    elif matches.len > 1:
+      die("ambiguous command: " & opts.sessions[0] & " (" & matches.join(", ") & "). " & UsageHint)
+    else:
+      rest = opts.sessions
 
-  let mode = opts.sessions[0]
-  var sessionName = if opts.sessions.len > 1: opts.sessions[1] else: ""
-  var cmd = if opts.sessions.len > 2: opts.sessions[2] else: getEnv("SHELL", "/bin/sh")
+  var sessionName = if rest.len > 0: rest[0] else: ""
+  var cmd = if rest.len > 1: rest[1] else: getEnv("SHELL", "/bin/sh")
 
   case mode
   of "daemon", "new":
@@ -80,7 +93,12 @@ proc main() =
     sessionName = resolveSession(sessionName)
   of "attach", "kill":
     if sessionName.len == 0:
-      die(mode & ": session name required")
+      if mode == "attach":
+        sessionName = oldestSession()
+        if sessionName.len == 0:
+          die("attach: no active sessions")
+      else:
+        die("kill: session name required")
   of "ls":
     discard
   else:
@@ -123,6 +141,18 @@ proc main() =
         # Detach from the client's session: the daemon must survive the
         # terminal closing (SIGHUP to the foreground process group)
         discard setsid()
+        # And from its fds: a daemon holding the spawning terminal or a
+        # script's pipes open keeps ssh logouts and pipe readers waiting.
+        # The socket is the daemon's only interface.
+        let nfd = posix.open("/dev/null", O_RDWR)
+        if nfd >= 0:
+          discard dup2(nfd, 0)
+          discard dup2(nfd, 1)
+          discard dup2(nfd, 2)
+          if nfd > 2:
+            discard posix.close(nfd)
+        for i in 3 .. 1023:
+          discard posix.close(cint(i))
         discard execv(exe.cstring, allocCStringArray(args))
         die("exec failed: " & exe)
       # The daemon runs in the foreground forever; wait for its socket,

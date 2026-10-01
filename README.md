@@ -27,7 +27,8 @@ nature — PTYs, unix sockets, termios); see the CI matrix for what's built.
 ## Local usage
 
 ```sh
-# Start a session named "main" running your shell
+# Start a session named "main" running your shell. `new` is the
+# default action, so `mpx main` does the same
 mpx new main
 
 # Session names are optional. No name = current directory's name
@@ -39,9 +40,10 @@ mpx new htop       # htop is a command, so: htop in session "mpx1"
 # Re-running `mpx new <name>` on an active session just attaches to it
 mpx new main
 
-# Or start daemon separately, then attach
+# Or start daemon separately, then attach (no name: oldest session)
 mpx daemon main
 mpx attach main
+mpx attach
 
 # List sessions
 mpx ls
@@ -50,6 +52,12 @@ mpx ls
 
 # Kill a session
 mpx kill main
+
+# Any unambiguous command prefix works
+mpx n main   # new
+mpx a main   # attach
+mpx l        # ls
+mpx k main   # kill
 ```
 
 When the program inside a session exits, the session ends and disappears

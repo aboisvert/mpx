@@ -19,6 +19,9 @@ const
   VersionFlags* = ["v", "version"]
   HelpFlags* = ["h", "help"]
 
+  # Command words, matched by unambiguous prefix in main
+  Modes* = ["daemon", "attach", "new", "ls", "kill"]
+
   FlagDocs* = [
     ("  -l, --listen <host:port>", "also listen on TCP; base port: each session takes the next free one"),
     ("  -p, --port <port>", "TCP base port, overrides the port in --listen"),
@@ -26,6 +29,14 @@ const
     ("  -v, --version", "show version"),
     ("  -h, --help", "show this help"),
   ]
+
+proc matchModes*(arg: string): seq[string] =
+  ## Every command arg is a prefix of. One match means arg selects that
+  ## command; none means arg is not a command at all (main treats it as a
+  ## `new` argument); more than one is ambiguous.
+  for m in Modes:
+    if m.startsWith(arg):
+      result.add(m)
 
 type
   Opts* = object
