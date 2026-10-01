@@ -1,4 +1,4 @@
-import std/[posix, os, strutils, selectors]
+import std/[posix, os, strutils, selectors, atomics]
 import mpx/[pty, protocol, log, config]
 import ttty/[terminal, grid]
 
@@ -12,6 +12,13 @@ type
     clients: seq[Client]
     running: bool
     term: Terminal  # ttty side cache for attach snapshots
+
+# Set by the signal handler, polled by the event loop: a signal interrupts
+# select (EINTR makes it return empty) and the loop condition picks it up.
+var shutdownRequested: Atomic[bool]
+
+proc onShutdown(sig: cint) {.noconv.} =
+  shutdownRequested.store(true, moRelaxed)
 
 proc newSession(name, cmd: string): Session =
   result.name = name
@@ -101,6 +108,12 @@ proc startTcpListener(sessionName: string, cfg: Config): (SocketHandle, int) =
 
 proc runDaemon*(sessionName, cmd: string, cfg: Config) =
   let log = initLogger(cfg.log)
+  # SIGTERM/SIGINT/SIGHUP must run the cleanup below, not skip it: the
+  # default disposition kills the daemon mid-flight and leaves socket,
+  # pid, and lock files behind for attach to trip over.
+  discard signal(SIGTERM, onShutdown)
+  discard signal(SIGINT, onShutdown)
+  discard signal(SIGHUP, onShutdown)
   log.info "daemon: session=" & sessionName & " cmd=" & cmd
   removeSocket(sessionName)
   let path = socketPath(sessionName)
@@ -145,7 +158,7 @@ proc runDaemon*(sessionName, cmd: string, cfg: Config) =
 
   log.info "listening on " & path
 
-  while session.running:
+  while session.running and not shutdownRequested.load(moRelaxed):
     let events = sel.select(-1)
     for ev in events:
       if ev.fd == listenFd.cint:

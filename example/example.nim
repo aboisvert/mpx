@@ -10,9 +10,16 @@ const
   Session = "example"
   RuntimeDir = "/tmp"
 
+proc sockExists(p: string): bool =
+  # fileExists is false for sockets: lstat only says the path is there
+  var st: Stat
+  lstat(p.cstring, st) == 0
+
 proc cleanup() =
   discard execCmd("pkill -f 'mpx daemon " & Session & "' 2>/dev/null")
+  discard execCmd("pkill -f 'mpx daemon bashdemo' 2>/dev/null")
   removeFile(RuntimeDir / "mpx" / Session & ".sock")
+  removeFile(RuntimeDir / "mpx" / "bashdemo.sock")
 
 cleanup()
 
@@ -26,9 +33,8 @@ if not daemon.running:
   echo "example: daemon failed to start"
   quit(1)
 
-# Verify socket exists (fileExists doesn't work on sockets on some systems)
-var sockInfo: Stat
-doAssert lstat(RuntimeDir / "mpx" / Session & ".sock", sockInfo) == 0, "socket not created"
+# Verify socket exists (fileExists doesn't work on sockets)
+doAssert sockExists(RuntimeDir / "mpx" / Session & ".sock"), "socket not created"
 echo "example: daemon started, socket exists"
 
 # Attach a client, send input, capture output
@@ -41,12 +47,25 @@ let (snap, _) = execCmdEx("timeout 2 ./mpx attach " & Session & " < /dev/null")
 doAssert "hello from example" in snap, "snapshot missing previous output: " & snap
 echo "example: snapshot on reattach verified"
 
-# Session ends when the contained program exits (here: cat sees EOF)
-let (bye, _) = execCmdEx("printf 'bye\\n'; sleep 1 | timeout 3 ./mpx attach " & Session)
-doAssert "bye" in bye, "expected echo of bye, got: " & bye
+# Session ends when the contained program exits: an `exit` typed into the
+# shell ends bash, the daemon sees PTY EOF, and cleanup removes the socket.
+# (The cat session above deliberately outlives its clients: detach-and-
+# reattach is the point of a multiplexer.)
+let bin = getCurrentDir() / "mpx"
+discard startProcess(bin, args=["daemon", "bashdemo", "/bin/bash"],
+                     options={poDaemon})
+var bashUp = false
+for i in 1..40:
+  if sockExists(RuntimeDir / "mpx" / "bashdemo.sock"):
+    bashUp = true
+    break
+  sleep(250)
+doAssert bashUp, "bashdemo daemon never started"
+let (bye, _) = execCmdEx("(echo 'exit'; sleep 1) | timeout 5 ./mpx attach bashdemo")
+doAssert "exit" in bye, "expected echo of exit, got: " & bye
 var dead = false
 for i in 1..20:
-  if not fileExists(RuntimeDir / "mpx" / Session & ".sock"):
+  if not sockExists(RuntimeDir / "mpx" / "bashdemo.sock"):
     dead = true
     break
   sleep(250)
@@ -54,7 +73,6 @@ doAssert dead, "daemon outlived child process"
 echo "example: session ends with child exit verified"
 
 # Default session name: no name = dir basename, then a counter
-let bin = getCurrentDir() / "mpx"
 let workdir = getTempDir() / "mpx_example_cwd"
 removeDir(workdir)
 createDir(workdir)
@@ -83,6 +101,52 @@ for i in 1..40:
   sleep(250)
 doAssert counted, "counter-suffixed session mpx_example_cwd0 missing from mpx ls"
 echo "example: counter suffix on name collision verified"
+
+# Signals run daemon cleanup: SIGTERM leaves no socket/pid/lock behind.
+# SIGKILL cannot run anything; the next attach cleans up and says so
+# instead of printing a raw socket path.
+let sigRt = getTempDir() / "mpx_example_sig"
+removeDir(sigRt)
+createDir(sigRt)
+proc startDaemonIn(rt, session: string): Process =
+  startProcess(bin, args=["daemon", session, "/bin/cat"],
+               env={"XDG_RUNTIME_DIR": rt}.newStringTable,
+               options={poDaemon})
+
+proc waitForSession(rt, session: string): int =
+  # The pid file is written before the socket is bound: waiting for the
+  # socket means the daemon is fully up and serving
+  for i in 1..40:
+    if sockExists(rt / "mpx" / (session & ".sock")):
+      return readFile(rt / "mpx" / (session & ".pid")).strip.parseInt
+    sleep(250)
+  doAssert false, "daemon never created its socket"
+
+discard startDaemonIn(sigRt, "sigdemo")
+let termPid = waitForSession(sigRt, "sigdemo")
+discard posix.kill(termPid.Pid, SIGTERM)
+var termClean = false
+for i in 1..40:
+  if not sockExists(sigRt / "mpx" / "sigdemo.sock"):
+    termClean = true
+    break
+  sleep(250)
+doAssert termClean, "SIGTERM left the socket behind"
+echo "example: SIGTERM runs daemon cleanup verified"
+
+discard startDaemonIn(sigRt, "k9demo")
+let k9Pid = waitForSession(sigRt, "k9demo")
+discard posix.kill(k9Pid.Pid, SIGKILL)
+sleep(300)
+doAssert sockExists(sigRt / "mpx" / "k9demo.sock"), "SIGKILL should leave the socket"
+let (staleOut, staleCode) = execCmdEx("timeout 3 env XDG_RUNTIME_DIR=" & sigRt &
+                                      " " & bin & " attach k9demo < /dev/null 2>&1")
+doAssert staleCode != 0, "attach to a dead daemon should fail"
+doAssert "cleaned stale socket" in staleOut,
+         "expected stale-socket cleanup message, got: " & staleOut
+doAssert not sockExists(sigRt / "mpx" / "k9demo.sock"), "attach should remove stale files"
+echo "example: attach cleans up after a SIGKILLed daemon verified"
+removeDir(sigRt)
 
 discard execCmd("pkill -f 'mpx daemon /bin/cat' 2>/dev/null")
 removeDir(workdir)

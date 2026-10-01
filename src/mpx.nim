@@ -98,6 +98,11 @@ proc main() =
     try:
       runClient(sessionName, cfg)
     except CatchableError:
+      # A SIGKILLed or crashed daemon leaves socket/pid/lock behind;
+      # connecting then fails with ECONNREFUSED. Clean the leftovers so
+      # the error names the session, not the socket path.
+      if not isActive(sessionName):
+        cleanStale(sessionName)  # dies: cleaned stale socket / no such session
       die(getCurrentExceptionMsg())
   of "new":
     if isActive(sessionName):
@@ -115,11 +120,24 @@ proc main() =
         args.add("--log")
       let pid = fork()
       if pid == 0:
+        # Detach from the client's session: the daemon must survive the
+        # terminal closing (SIGHUP to the foreground process group)
+        discard setsid()
         discard execv(exe.cstring, allocCStringArray(args))
         die("exec failed: " & exe)
+      # The daemon runs in the foreground forever; wait for its socket,
+      # not for the process. WNOHANG catches an early exit (bad cmd, bind
+      # failure) so it surfaces instead of hanging until the timeout.
+      var ready = false
       var status: cint = 0
-      discard waitpid(pid, status, 0)
-      if not isActive(sessionName):
+      for i in 1 .. 100:
+        if isActive(sessionName):
+          ready = true
+          break
+        if posix.waitpid(pid, status, WNOHANG) == pid:
+          break
+        sleep(50)
+      if not ready:
         die("daemon failed to start: " & sessionName)
     try:
       runClient(sessionName, cfg)
@@ -131,7 +149,11 @@ proc main() =
     if dirExists(dir):
       for (_, f) in walkDir(dir):
         if f.endsWith(".sock"):
-          echo f.extractFilename.changeFileExt("")
+          let name = f.extractFilename.changeFileExt("")
+          # A killed daemon can leave a socket behind: list only sessions
+          # that still answer
+          if isActive(name):
+            echo name
   of "kill":
     if not isActive(sessionName):
       # Daemon is gone; leftover files are stale garbage, clean them
