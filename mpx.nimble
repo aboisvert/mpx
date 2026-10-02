@@ -19,4 +19,7 @@ task example, "Run example end-to-end":
   exec "./build/example"
 
 task test, "Run tests":
-  exec "nimble c -r --hints:off tests/test1.nim"
+  when defined(windows):
+    exec "nimble c -r --hints:off tests/test_windows.nim"
+  else:
+    exec "nimble c -r --hints:off tests/test1.nim"

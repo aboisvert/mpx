@@ -1,0 +1,62 @@
+name: Windows amd64
+
+on:
+  push:
+    branches: [main]
+    tags: ['[0-9]+.[0-9]+.[0-9]+']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: 2.2.12
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install dependencies
+        run: nimble install -y --depsOnly
+
+      - name: Generate nimble.paths for direct nim invocations
+        # The committed nimble.lock disables nim's pkgs2 package scan, so
+        # the raw `nim c` build steps get no dependency paths. nimble.paths
+        # (gitignored, included by config.nims) restores them.
+        shell: bash
+        run: |
+          { echo '--noNimblePath'
+            for d in "$HOME"/.nimble/pkgs2/*/; do echo "--path:\"$d\""; done
+          } > nimble.paths
+          cat nimble.paths
+
+      - name: Build
+        run: nim c --hints:off --path:src -d:release -o:mpx.exe src/mpx.nim
+
+      - name: Test
+        # Runtime smoke test, not just a compile: new cmd, ConPTY child,
+        # attach roundtrip over loopback TCP, detach, snapshot, ls, kill.
+        run: nimble test
+
+      - name: Package
+        run: |
+          New-Item -ItemType Directory -Force mpx-windows-amd64 | Out-Null
+          Copy-Item mpx.exe mpx-windows-amd64/
+          ./mpx.exe -v | Out-File -Encoding utf8 mpx-windows-amd64/VERSION
+          Copy-Item README.md mpx-windows-amd64/
+          Compress-Archive -Path mpx-windows-amd64 -DestinationPath mpx-windows-amd64.zip
+
+      - name: Upload artifact (GitHub Actions)
+        uses: actions/upload-artifact@v4
+        with:
+          name: mpx-windows-amd64
+          path: mpx-windows-amd64.zip
+
+      - name: Upload artifact to mpx.capocasa.dev
+        if: github.ref == 'refs/heads/main'
+        run: |
+          curl.exe -f -H "Authorization: Bearer ${{ secrets.RELEASE_SECRET }}" -F "file=@mpx-windows-amd64.zip" `
+            https://mpx.capocasa.dev/main/builds/upload.nim
