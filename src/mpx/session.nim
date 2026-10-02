@@ -36,11 +36,13 @@ proc resolveSession*(name: string): string =
   while true:
     let candidate = if i < 0: base else: base & $i
     inc i
-    if fileExists(dir / candidate & EndpointExt) or fileExists(dir / candidate & ".lock"):
+    if fileExists(socketPath(candidate)) or
+       fileExists(socketPath(candidate).changeFileExt(".lock")):
       continue
     when defined(windows):
       # CREATE_NEW is the atomic exclusivity O_EXCL provides on posix
-      let h = createFileW(newWideCString(dir / candidate & ".lock"), GENERIC_WRITE,
+      let h = createFileW(newWideCString(
+          socketPath(candidate).changeFileExt(".lock")), GENERIC_WRITE,
                           FILE_SHARE_READ or FILE_SHARE_WRITE, nil, CREATE_NEW,
                           FILE_ATTRIBUTE_NORMAL, 0)
       if h == INVALID_HANDLE_VALUE:
@@ -49,7 +51,8 @@ proc resolveSession*(name: string): string =
         raise newException(OSError, "cannot create session lock in " & dir)
       discard closeHandle(h)
     else:
-      let fd = posix.open((dir / candidate & ".lock").cstring, O_CREAT or O_EXCL or O_WRONLY, 0o600)
+      let fd = posix.open(socketPath(candidate).changeFileExt(".lock").cstring,
+                           O_CREAT or O_EXCL or O_WRONLY, 0o600)
       if fd < 0:
         if errno == EEXIST:
           continue  # someone else claimed it between the check and the create

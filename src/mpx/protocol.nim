@@ -135,10 +135,33 @@ proc recvMsg*(fd: SocketHandle): tuple[kind: MsgKind, payload: seq[byte]] =
 proc socketPath*(sessionName: string): string =
   ## The daemon's endpoint file: the unix socket path on posix, the .port
   ## file carrying the loopback TCP port on Windows.
+  ##
+  ## sockaddr_un.sun_path is only 92 bytes on macOS and TMPDIR alone eats
+  ## ~50 of them, so a name whose plain path would not fit folds to a
+  ## readable prefix plus a deterministic FNV-1a digest of the full name.
+  ## Every lookup goes through this proc, and a folded name is always
+  ## short enough to resolve to itself, so `ls` output still attaches.
   when defined(windows):
     mpxDir() / sessionName & ".port"
   else:
-    mpxDir() / sessionName & ".sock"
+    const sunPathLen = block:
+      var sa: Sockaddr_un
+      sa.sun_path.len
+    proc fnv1a(s: string): uint32 =
+      var h = 2166136261'u32
+      for c in s:
+        h = (h xor c.uint32) * 16777619'u32
+      h
+    let dir = mpxDir()
+    let plain = dir / sessionName & ".sock"
+    if plain.len < sunPathLen:
+      return plain
+    # name budget = sunPathLen - NUL - dir - sep - ".sock"; digest eats 9
+    let prefixLen = sunPathLen - 1 - dir.len - 1 - 5 - 9
+    if prefixLen < 1:
+      return plain  # not even a digest fits: let bind() name the problem
+    let prefix = sessionName[0 ..< min(sessionName.len, prefixLen)]
+    dir / prefix & "-" & fnv1a(sessionName).toHex & ".sock"
 
 proc removeSocket*(sessionName: string) =
   ## Remove a stale socket. Never removes the session lock file: the daemon

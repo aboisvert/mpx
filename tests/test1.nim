@@ -1,4 +1,5 @@
 import std/[unittest, os, osproc, strutils]
+import std/posix except SocketHandle
 import mpx/[protocol, pty, session, log, config, cli, runtime]
 import ttty/[terminal, grid]
 
@@ -8,6 +9,18 @@ test "socketPath":
   check "mpx" in path
   check "test.sock" in path
   check path == mpxDir() / "test.sock"
+
+test "socketPath folds long names under sun_path":
+  # macOS sun_path is 92 bytes; a deep TMPDIR plus a long name overflows it
+  var sa: Sockaddr_un
+  let limit = sa.sun_path.len
+  let long = repeat("x", 300)
+  let p = socketPath(long)
+  check p.len < limit
+  check p == socketPath(long)          # deterministic across processes
+  check socketPath(long) != socketPath(long & "y")
+  check p.splitFile.ext == ".sock"
+  check "xxxx" in p                    # readable prefix survives the fold
 
 test "resolveSession named passes through":
   check resolveSession("work") == "work"

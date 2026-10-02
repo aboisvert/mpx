@@ -165,8 +165,8 @@ removeDir(sigRt)
 # The default action is `new`: bare `mpx` starts a session named after
 # the directory and attaches to it. Commands work by unambiguous prefix,
 # and `attach` with no name picks the oldest live session.
-let defRt = getTempDir() / "mpx_example_default"
-let defDir = getTempDir() / "mpx_example_defdir"
+let defRt = getTempDir() / "mpxexd"
+let defDir = getTempDir() / "mpx_exdef"
 proc defEnv(): string = "env XDG_RUNTIME_DIR=" & defRt
 removeDir(defRt)
 removeDir(defDir)
@@ -180,13 +180,13 @@ let (bareOut, bareRc) = runTimed("(sleep 1) | " & defEnv() & " " & bin &
                                   " 2>&1 > /dev/null", 5, defDir)
 doAssert bareRc == 0, "bare mpx failed: " & bareOut
 let (defLs, _) = execCmdEx(defEnv() & " " & bin & " l")
-doAssert "mpx_example_defdir" in defLs,
+doAssert "mpx_exdef" in defLs,
          "bare mpx did not start a cwd-named session: " & defLs
 echo "example: bare mpx starts a session named after the cwd verified"
 
 # Seed the old session with distinctive output, then start a younger one
 let (seedOut, _) = runTimed("(echo 'echo OLDSESS'; sleep 1) | " &
-                            defEnv() & " " & bin & " at mpx_example_defdir", 5)
+                            defEnv() & " " & bin & " at mpx_exdef", 5)
 doAssert "OLDSESS" in seedOut, "could not seed the old session: " & seedOut
 discard startProcess(bin, args=["d", "youngdemo", "/bin/cat"],
                      env={"XDG_RUNTIME_DIR": defRt}.newStringTable,
@@ -205,11 +205,11 @@ doAssert "hello young" notin oldestOut,
 echo "example: attach with no name picks the oldest session verified"
 
 # Prefixes drive kill too, and the sessions go away
-let (_, killOld) = execCmdEx(defEnv() & " " & bin & " ki mpx_example_defdir")
+let (_, killOld) = execCmdEx(defEnv() & " " & bin & " ki mpx_exdef")
 let (_, killYoung) = execCmdEx(defEnv() & " " & bin & " ki youngdemo")
 doAssert killOld == 0 and killYoung == 0, "prefix kill failed"
 let (afterKill, _) = execCmdEx(defEnv() & " " & bin & " l")
-doAssert "youngdemo" notin afterKill and "mpx_example_defdir" notin afterKill
+doAssert "youngdemo" notin afterKill and "mpx_exdef" notin afterKill
 echo "example: command prefixes verified"
 
 # No-name attach with nothing alive is a clean error
