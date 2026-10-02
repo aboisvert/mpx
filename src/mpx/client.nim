@@ -159,6 +159,10 @@ when not defined(windows):
         discard fcntl(0, F_SETFL, fl)
         if n > 0:
           discard sendMsg(fd, mkInput, buf[0..<n])
+        elif n == 0:
+          # EOF: unselectable stdin still ends the session when it closes.
+          # An empty nonblocking read reports -1 EAGAIN, never 0.
+          running = false
 
     # Restore terminal
     discard signal(SIGWINCH, oldWinch)
@@ -171,6 +175,8 @@ when not defined(windows):
 
 else:
 
+  const StdinBufCap = 4096
+
   type
     ResizeWatch = object
       # Shared with the poller thread: the size stash is the last sample
@@ -179,6 +185,55 @@ else:
       ev: Handle
       w, h: Atomic[int]
       stop: Atomic[bool]
+
+    Spin = object
+      held: Atomic[bool]
+
+    StdinWatch = object
+      # stdin arrives on a thread of its own: a pipe or console input
+      # handle cannot share WaitForMultipleObjects with events (a pipe
+      # makes the wait return immediately forever), so the reader thread
+      # blocks in readFile and pokes an event instead. Raw CreateThread,
+      # so no allocation on that thread: fixed buffers swapped under the
+      # spinlock, same discipline as the daemon's pty reader.
+      hIn: Handle
+      ev: Handle
+      bufs: array[2, array[StdinBufCap, byte]]
+      lens: array[2, int]   # 0 means the slot is free for the reader
+      eof: Atomic[bool]
+      spin: Spin
+
+  proc acquire(s: var Spin) =
+    while s.held.exchange(true, moAcquire):
+      discard
+
+  proc release(s: var Spin) =
+    s.held.store(false, moRelease)
+
+  proc stdinProc(param: pointer): DWORD {.stdcall, gcsafe.} =
+    let w = cast[ptr StdinWatch](param)
+    while not w.eof.load(moRelaxed):
+      var slot = -1
+      while slot < 0:
+        w.spin.acquire()
+        if w.lens[0] == 0:
+          slot = 0
+        elif w.lens[1] == 0:
+          slot = 1
+        w.spin.release()
+        if slot < 0:
+          sleep(1)  # both slots full: the loop drains them
+      var n: int32
+      if readFile(w.hIn, addr w.bufs[slot][0], StdinBufCap.int32,
+                  addr n, nil) == 0 or n <= 0:
+        w.eof.store(true, moRelaxed)
+        discard setEvent(w.ev)
+        return 0
+      w.spin.acquire()
+      w.lens[slot] = n.int
+      w.spin.release()
+      discard setEvent(w.ev)
+    0
 
   proc consoleSize(hOut: Handle): tuple[w, h: int] =
     var info: CONSOLE_SCREEN_BUFFER_INFO
@@ -233,8 +288,11 @@ else:
     let sockEv = wsaCreateEvent()
     var watch = ResizeWatch(hOut: hOut)
     watch.ev = createEvent(nil, 0, 0, nil)  # auto-reset: one resize per wake
+    var stdinWatch = StdinWatch(hIn: hIn)
+    stdinWatch.ev = createEvent(nil, 0, 0, nil)  # auto-reset: one drain per wake
     if sockEv == Handle(0) or sockEv == Handle(-1) or
-        watch.ev == Handle(0) or watch.ev == Handle(-1):
+        watch.ev == Handle(0) or watch.ev == Handle(-1) or
+        stdinWatch.ev == Handle(0) or stdinWatch.ev == Handle(-1):
       raise newException(OSError, "event creation failed: " & $getLastError())
     # WSAEventSelect turns the socket nonblocking, which is why it comes
     # after the attach exchange above: that read must block for its frame.
@@ -263,21 +321,60 @@ else:
     if w0 > 0 and h0 > 0:
       w = w0
       h = h0
-    discard sendMsg(fd, mkResize, [byte(w shr 8), byte(w and 0xff), byte(h shr 8), byte(h and 0xff)])
+    discard sendMsg(fd, mkResize,
+      [byte(w shr 8), byte(w and 0xff), byte(h shr 8), byte(h and 0xff)])
     watch.w.store(w, moRelaxed)
     watch.h.store(h, moRelaxed)
-    let thread = CreateThread(nil, 0, resizeProc, cast[pointer](addr watch), 0, nil)
-    if thread == Handle(0):
+    let resizeThread = CreateThread(nil, 0, resizeProc,
+                                    cast[pointer](addr watch), 0, nil)
+    let stdinThread = CreateThread(nil, 0, stdinProc,
+                                   cast[pointer](addr stdinWatch), 0, nil)
+    if resizeThread == Handle(0) or stdinThread == Handle(0):
       discard setConsoleMode(hIn, oldIn)
       discard setConsoleMode(hOut, oldOut)
       raise newException(OSError, "CreateThread failed: " & $getLastError())
 
     var running = true
     var inbuf: seq[byte]  # partial frame(s) read off the nonblocking socket
+
+    proc handleSocket(fd: SocketHandle, hOut: Handle) =
+      ## FD_READ is edge-set once per arrival: whatever landed before the
+      ## event select was armed (or between wakes) must be pulled by
+      ## hand, then every complete frame in it is rendered. A frame can
+      ## straddle reads on a nonblocking socket, so bytes accumulate
+      ## until complete.
+      var buf: array[4096, byte]
+      while running:
+        let n = recv(fd, addr buf[0], buf.len.cint, 0)
+        if n > 0:
+          inbuf.add buf[0..<n]
+        elif n == 0:
+          running = false  # orderly close
+        elif wsaGetLastError() == WSAEWOULDBLOCK:
+          break
+        else:
+          running = false
+      try:
+        var kind: MsgKind
+        var payload: seq[byte]
+        while running and takeFrame(inbuf, kind, payload):
+          case kind
+          of mkOutput:
+            if payload.len > 0:
+              var written: int32
+              discard writeFile(hOut, unsafeAddr payload[0],
+                                payload.len.int32, addr written, nil)
+          else:
+            discard  # another client resized; we just follow the pty
+      except IOError:
+        running = false
+
+    handleSocket(fd, hOut)
+
     while running:
       var handles: array[3, Handle]
-      handles[0] = watch.ev
-      handles[1] = hIn
+      handles[0] = stdinWatch.ev
+      handles[1] = watch.ev
       handles[2] = sockEv
       let r = waitForMultipleObjects(3, cast[PWOHandleArray](addr handles[0]),
                                      0, INFINITE)
@@ -285,70 +382,53 @@ else:
         break
       let idx = r.int - WAIT_OBJECT_0.int
       if idx == 0:
+        # stdin -> daemon, through the detach key. The reader thread
+        # parked one or two chunks in the fixed slots; take them without
+        # holding the spinlock across the network write.
+        for slot in 0 .. 1:
+          stdinWatch.spin.acquire()
+          let n = stdinWatch.lens[slot]
+          stdinWatch.spin.release()
+          if n == 0:
+            continue
+          # Ctrl-G (BEL) detaches; everything else reaches the program.
+          # Detach only on a lone keypress: a BEL inside pasted text must
+          # not kick the client out of the session.
+          if n == 1 and stdinWatch.bufs[slot][0] == CtrlG:
+            discard sendMsg(fd, mkDetach)
+            running = false
+          else:
+            discard sendMsg(fd, mkInput,
+              toOpenArray(stdinWatch.bufs[slot], 0, n - 1))
+          stdinWatch.spin.acquire()
+          stdinWatch.lens[slot] = 0
+          stdinWatch.spin.release()
+        if stdinWatch.eof.load(moRelaxed):
+          running = false
+      elif idx == 1:
         # The poller saw the console move: claim the new size for the
         # session.
         let w = watch.w.load(moAcquire)
         let h = watch.h.load(moAcquire)
         discard sendMsg(fd, mkResize,
           [byte(w shr 8), byte(w and 0xff), byte(h shr 8), byte(h and 0xff)])
-      elif idx == 1:
-        # console -> daemon, through the detach key. The input handle is
-        # waitable, and the read after the wake takes what is there.
-        var buf: array[4096, byte]
-        var n: int32
-        if readFile(hIn, addr buf[0], buf.len.int32, addr n, nil) != 0 and n > 0:
-          # Ctrl-G (BEL) detaches; everything else reaches the program.
-          # Detach only on a lone keypress: a BEL inside pasted text must
-          # not kick the client out of the session.
-          if n == 1 and buf[0] == CtrlG:
-            discard sendMsg(fd, mkDetach)
-            running = false
-          else:
-            discard sendMsg(fd, mkInput, buf[0..<n])
-        else:
-          running = false
       elif idx == 2:
         # daemon -> console. WSAEnumNetworkEvents is the reset.
         var ne: WSANETWORKEVENTS
         discard WSAEnumNetworkEvents(fd, sockEv, addr ne)
-        if (ne.lNetworkEvents and FD_READ) != 0:
-          var buf: array[4096, byte]
-          while running:
-            let n = recv(fd, addr buf[0], buf.len.cint, 0)
-            if n > 0:
-              inbuf.add buf[0..<n]
-            elif n == 0:
-              running = false  # orderly close
-            elif wsaGetLastError() == WSAEWOULDBLOCK:
-              break
-            else:
-              running = false
-          try:
-            # Frame per wake: a frame can straddle reads on a
-            # nonblocking socket, so bytes accumulate until complete.
-            var kind: MsgKind
-            var payload: seq[byte]
-            while running and takeFrame(inbuf, kind, payload):
-              case kind
-              of mkOutput:
-                if payload.len > 0:
-                  var written: int32
-                  discard writeFile(hOut, unsafeAddr payload[0],
-                                    payload.len.int32, addr written, nil)
-              else:
-                discard  # another client resized; we just follow the pty
-          except IOError:
-            running = false
-        if (ne.lNetworkEvents and FD_CLOSE) != 0:
-          running = false
+        if (ne.lNetworkEvents and (FD_READ or FD_CLOSE)) != 0:
+          handleSocket(fd, hOut)
 
     # Cleanup: stop the poller before restoring, so no resize lands after
-    # the console went back to cooked mode.
+    # the console went back to cooked mode. The stdin reader may sit in
+    # readFile until the next byte forever; the process exit reaps it.
     watch.stop.store(true, moRelease)
-    discard waitForSingleObject(thread, 1000)
+    discard waitForSingleObject(resizeThread, 1000)
     discard setConsoleMode(hIn, oldIn)
     discard setConsoleMode(hOut, oldOut)
-    discard closeHandle(thread)
+    discard closeHandle(resizeThread)
+    discard closeHandle(stdinThread)
     discard closeHandle(watch.ev)
+    discard closeHandle(stdinWatch.ev)
     discard closeHandle(sockEv)
     discard closeSocket(fd)
