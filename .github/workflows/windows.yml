@@ -28,8 +28,9 @@ jobs:
         # (gitignored, included by config.nims) restores them.
         shell: bash
         run: |
+          # cygpath -m: nim on Windows cannot read git-bash's /c/ mount paths
           { echo '--noNimblePath'
-            for d in "$HOME"/.nimble/pkgs2/*/; do echo "--path:\"$d\""; done
+            for d in "$HOME"/.nimble/pkgs2/*/; do echo "--path:\"$(cygpath -m "$d")\""; done
           } > nimble.paths
           cat nimble.paths
 
