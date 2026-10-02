@@ -48,7 +48,12 @@ mpx attach
 # List sessions
 mpx ls
 
-# Detach: Ctrl+\
+# Detach: Ctrl-A d (screen style) or Ctrl-\ (dtach style)
+#
+# Ctrl-A is a prefix like screen's: Ctrl-A d detaches, Ctrl-A Ctrl-A
+# sends a literal Ctrl-A to the program, Ctrl-A <anything else> goes
+# through untouched. Ctrl-D is NOT a detach key: it is EOF, and it
+# reaches the program so shells, REPLs and pagers behave normally.
 
 # Kill a session
 mpx kill main

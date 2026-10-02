@@ -4,6 +4,10 @@ import mpx/[protocol, config, pty]
 # Not exported by Nim's posix: Linux, macOS, and the BSDs all use 28.
 const SIGWINCH = cint(28)
 
+const
+  CtrlA = 0x01.byte        # screen-style command prefix
+  CtrlBackslash = 0x1c.byte  # dtach-style single-key detach
+
 # Self-pipe for SIGWINCH: the handler only pokes a byte (write to a pipe
 # is async-signal-safe); the resize frame itself is sent from the main
 # loop. Writing the socket from the handler interleaved a frame between
@@ -84,6 +88,8 @@ proc runClient*(sessionName: string, cfg: Config) =
     discard fcntl(winchPipe[i], F_SETFL, pfl or O_NONBLOCK)
   let oldWinch = signal(SIGWINCH, onWinch)
 
+  var prefixPending = false
+
   var sel = newSelector[SocketHandle]()
   sel.registerHandle(fd, {Event.Read}, fd)
   sel.registerHandle(winchPipe[0].SocketHandle, {Event.Read}, winchPipe[0].SocketHandle)
@@ -101,17 +107,34 @@ proc runClient*(sessionName: string, cfg: Config) =
     let events = sel.select(if stdinRegistered: -1 else: 100)
     for ev in events:
       if ev.fd == 0:
-        # stdin -> daemon
+        # stdin -> daemon, through the detach keys
         var buf: array[4096, byte]
         let n = posix.read(0, addr buf[0], buf.len)
         if n > 0:
-          # Ctrl+\ (0x1c) detaches; Ctrl+D passes through so the
-          # contained program sees EOF and can exit
-          if n == 1 and buf[0] == 0x1c:
-            discard sendMsg(fd, mkDetach)
-            running = false
-          else:
-            discard sendMsg(fd, mkInput, buf[0..<n])
+          var i = 0
+          while i < n and running:
+            let b = buf[i]
+            inc i
+            if prefixPending:
+              prefixPending = false
+              if b == byte('d'):
+                discard sendMsg(fd, mkDetach)
+                running = false
+              elif b == CtrlA:
+                discard sendMsg(fd, mkInput, [CtrlA])
+              else:
+                # not a prefix command we know: the pair goes through
+                # untouched, transparency over cleverness
+                discard sendMsg(fd, mkInput, [CtrlA, b])
+            elif b == CtrlA:
+              prefixPending = true
+            elif b == CtrlBackslash:
+              discard sendMsg(fd, mkDetach)
+              running = false
+            else:
+              # bulk of typing: forward the rest of the chunk at once
+              discard sendMsg(fd, mkInput, buf[i-1 ..< n])
+              break
         else:
           running = false
       elif ev.fd == winchPipe[0]:
