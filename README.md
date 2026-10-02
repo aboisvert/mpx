@@ -127,31 +127,6 @@ to attach, but treat this as convenience, not a security boundary. Keep
 the listener on a private interface (wireguard, tailnet, localhost) and
 put real authentication in front if you need it.
 
-## systemd
-
-Copy `mpx@.service` to `~/.config/systemd/user/` (create the dir if needed):
-
-```sh
-mkdir -p ~/.config/systemd/user
-cp mpx@.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-```
-
-Then:
-
-```sh
-# Start session "main" as a service
-systemctl --user start mpx@main
-
-# Attach to it
-mpx attach main
-
-# Enable at login
-systemctl --user enable mpx@main
-```
-
-The `%i` in the unit file is the session name. `mpx@main` = session "main".
-
 ## How it works
 
 - **Daemon** owns the PTY master, forwards bytes verbatim in both directions.
