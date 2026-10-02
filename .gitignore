@@ -5,3 +5,7 @@ example/example
 tests/test1
 *.sock
 *.out
+nimble.develop
+nimble.paths
+nimbledeps
+nimble.paths

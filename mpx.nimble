@@ -13,8 +13,10 @@ requires "nim >= 2.2.10"
 requires "ttty >= 0.5.2"
 
 task example, "Run example end-to-end":
-  exec "nim c --hints:off --path:src -o:build/example example/example.nim"
+  # nimble c, not raw nim: the committed nimble.lock disables nim's pkgs2
+  # scan, so only nimble resolves the dependency paths.
+  exec "nimble c --hints:off -o:build/example example/example.nim"
   exec "./build/example"
 
 task test, "Run tests":
-  exec "nim c -r --hints:off --path:src tests/test1.nim"
+  exec "nimble c -r --hints:off tests/test1.nim"

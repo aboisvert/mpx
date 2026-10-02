@@ -1,0 +1,41 @@
+{
+  "version": 2,
+  "packages": {
+    "nim": {
+      "version": "2.2.12",
+      "vcsRevision": "d595ef18c7c4d5a3e5a8668509678e0569f78f6b",
+      "url": "https://github.com/nim-lang/Nim.git",
+      "downloadMethod": "git",
+      "dependencies": [],
+      "checksums": {
+        "sha1": "1ce02ec327934128234547c648d5ee3612c21b50"
+      }
+    },
+    "x11": {
+      "version": "1.2",
+      "vcsRevision": "29aca5e519ebf5d833f63a6a2769e62ec7bfb83a",
+      "url": "https://github.com/nim-lang/x11",
+      "downloadMethod": "git",
+      "dependencies": [
+        "nim"
+      ],
+      "checksums": {
+        "sha1": "6db9aa495a228e9e68faa80acf301f60accd8e5a"
+      }
+    },
+    "ttty": {
+      "version": "0.5.4",
+      "vcsRevision": "455c4f67989a65bb8f36e62e5b330ee05dc51979",
+      "url": "https://github.com/capocasa/ttty",
+      "downloadMethod": "git",
+      "dependencies": [
+        "nim",
+        "x11"
+      ],
+      "checksums": {
+        "sha1": "d4c0160eea16f68b6e6b341cf6a22e1ea21d032d"
+      }
+    }
+  },
+  "tasks": {}
+}

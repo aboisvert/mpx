@@ -19,14 +19,16 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /Users/runner/nim-toolchain
-          key: ${{ runner.os }}-${{ runner.arch }}-nim-toolchain-${{ hashFiles('mpx.nimble') }}
+          # Key includes the pinned nim-version: a hit must never resurrect
+          # a toolchain older/newer than the nim-version input above.
+          key: ${{ runner.os }}-${{ runner.arch }}-nim-toolchain-2.2.12-${{ hashFiles('mpx.nimble') }}
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-nim-toolchain-
 
       - uses: jiro4989/setup-nim-action@v2
         if: steps.cache-nim.outputs.cache-hit != 'true'
         with:
-          nim-version: stable
+          nim-version: 2.2.12
           repo-token: ${{ secrets.GITHUB_TOKEN }}
           parent-nim-install-directory: $HOME
           nim-install-directory: nim-toolchain
@@ -37,6 +39,16 @@ jobs:
 
       - name: Install dependencies
         run: nimble install -y --depsOnly
+
+      - name: Generate nimble.paths for direct nim invocations
+        # The committed nimble.lock disables nim's pkgs2 package scan, so
+        # the raw `nim c` build steps get no dependency paths. nimble.paths
+        # (gitignored, included by config.nims) restores them.
+        run: |
+          { echo '--noNimblePath'
+            for d in "$HOME"/.nimble/pkgs2/*/; do echo "--path:\"$d\""; done
+          } > nimble.paths
+          cat nimble.paths
 
       - name: Build
         # macos-latest is arm64; the amd64 slice is cross-compiled on the

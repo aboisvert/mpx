@@ -16,13 +16,23 @@ jobs:
 
       - uses: jiro4989/setup-nim-action@v2
         with:
-          nim-version: stable
+          nim-version: 2.2.12
           repo-token: ${{ secrets.GITHUB_TOKEN }}
           parent-nim-install-directory: $HOME
           nim-install-directory: nim-toolchain
 
       - name: Install dependencies
         run: nimble install -y --depsOnly
+
+      - name: Generate nimble.paths for direct nim invocations
+        # The committed nimble.lock disables nim's pkgs2 package scan, so
+        # the raw `nim c` build step gets no dependency paths. nimble.paths
+        # (gitignored, included by config.nims) restores them.
+        run: |
+          { echo '--noNimblePath'
+            for d in "$HOME"/.nimble/pkgs2/*/; do echo "--path:\"$d\""; done
+          } > nimble.paths
+          cat nimble.paths
 
       - name: Build
         run: nim c --hints:off --path:src -d:release -o:mpx src/mpx.nim
