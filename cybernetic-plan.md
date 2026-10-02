@@ -54,19 +54,34 @@ push, no nimble install after commits.
 
 ## Current State
 
-Step 1 done: `src/mpx/win.nim` exists and checks clean under
-`--os:windows`. It imports and re-exports std/winlean (which already
-supplies createPipe, createProcessW, waitForSingleObject,
-waitForMultipleObjects, terminateProcess, OpenProcess's cousins, socket
-primitives, MAXIMUM_WAIT_OBJECTS, DETACHED_PROCESS, SYNCHRONIZE) and
-declares the missing pieces: ConPTY trio + HPCON/COORD,
-STARTUPINFOEXW + attribute-list procs, console procs + types + flags,
-CreateEventW/SetEvent/CreateThread, CreateFileW, WSACreateEvent/
-WSAEventSelect/ioctlsocket, OpenProcess, FIONBIO/FD_* consts,
-initWinsock(). Posix build/test/example stay green (win.nim is not
-imported by anything posix yet). Existing workflows untouched:
-linux-amd64.yml, linux-arm64.yml, osx.yml, termux.yml, release.yml
-(release.yml still needs windows-amd64 added in step 8).
+Steps 1-2 done. `src/mpx/win.nim` is the one import layer, now pruned:
+it re-exports std/winlean and only declares what winlean genuinely lacks
+(ConPTY trio + HPCON, STARTUPINFOEXW + attribute-list procs,
+GetConsoleScreenBufferInfo + CONSOLE_SCREEN_BUFFER_INFO/SMALL_RECT,
+CreateThread + ThreadProc, ioctlsocket + FIONBIO,
+EXTENDED_STARTUPINFO_PRESENT, CREATE_BREAKAWAY_FROM_JOB,
+CREATE_NEW_PROCESS_GROUP, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+ERROR_BROKEN_PIPE/ERROR_NO_DATA, initWinsock). Step 2 discovered
+winlean already had COORD, openProcess, createEvent, setEvent,
+Get/SetConsoleMode, readConsoleInput, wsaCreateEvent/wsaEventSelect,
+createFileW and the ENABLE_, FD_, GENERIC_, FILE_SHARE_, CREATE_NEW,
+PROCESS_TERMINATE consts under camelCase names; the duplicates were
+removed because Nim's style-insensitive lookup made them ambiguous at
+every use site. Callers of win.nim use winlean's camelCase spellings
+(createEvent, setEvent, openProcess, createFileW, wsaEventSelect,
+getConsoleMode, and so on) via the re-export; winlean's FD_* consts are
+int32 while wsaEventSelect wants clong, which widens fine.
+`src/mpx/pty.nim` now has both branches behind one API: defaultShell()
+(SHELL on posix, pwsh/powershell/cmd probe on Windows, empty cmd means
+default shell), openPty/setSize/read/write/close; the Windows Pty
+carries hpc/inWrite/outRead/hProcess, read and write are blocking
+ReadFile/WriteFile and broken-pipe reads return 0 as EOF. Nothing
+imports win.nim on posix yet; posix build/test/example green; windows
+check clean on win.nim and pty.nim. daemon/client/protocol/session/
+mpx are still posix-only until steps 3-6. Note for step 4: mpx.nim
+still resolves the shell itself (getEnv SHELL, /bin/sh), so the
+Windows spawn rewire must route the no-command case through
+defaultShell() or pass an empty cmd.
 
 ## Steps
 
@@ -91,17 +106,32 @@ linux-amd64.yml, linux-arm64.yml, osx.yml, termux.yml, release.yml
   PROCESS_TERMINATE. Added `initWinsock()` (WSAStartup 2.2, raises
   OSError). Verified: windows check clean, posix build + nimble test +
   nimble example green.
-- [ ] 2. **pty.nim Windows branch.** Gate the posix code with
-  `when not defined(windows)`; add the ConPTY branch behind the same
-  `Pty` API: openPty (CreatePipe pair, CreatePseudoConsole with initial
-  size, CreateProcessW with the pseudoconsole attribute, running the
-  resolved default shell when cmd is the shell case), setSize
-  (ResizePseudoConsole), read/write (ReadFile/WriteFile on the pipe
-  ends, blocking), close (ClosePseudoConsole + closing handles), plus a
-  way for the daemon to learn the child exited (WaitForSingleObject on
-  the process handle, or read returning broken-pipe). Default-shell
-  resolution helper shared by both branches. Verify: posix build + test
-  green; `nim check --os:windows` clean on pty.nim.
+- [x] 2. **pty.nim Windows branch.** Done. Posix code gated behind
+  `when not defined(windows)`, ConPTY branch behind the same `Pty` API.
+  Shared `defaultShell()`: $SHELL on posix, findExe probe of pwsh.exe,
+  powershell.exe, cmd.exe on Windows; an empty `cmd` means the default
+  shell in both branches (mpx.nim still resolves non-empty cmds itself
+  until step 4 rewires that). Windows Pty fields: hpc, inWrite, outRead,
+  hProcess, the last so the daemon can WaitForSingleObject on child exit
+  without relying on the read side. openPty: two non-inheritable
+  createPipe pairs, CreatePseudoConsole(size, inRead, outWrite), our
+  copies of the consumed ends closed, STARTUPINFOEXW sized attribute
+  list carrying PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, createProcessW with
+  EXTENDED_STARTUPINFO_PRESENT passing `si.StartupInfo` to winlean's
+  `var STARTUPINFO` param, minimal quoteArg for args, pi.hThread closed
+  at once. setSize = ResizePseudoConsole. read/write = blocking
+  ReadFile/WriteFile (winlean takes int32 counts); read maps
+  ERROR_BROKEN_PIPE/ERROR_NO_DATA to 0 (EOF, like a posix master) and
+  anything else to -1. close: inWrite first so the console sees input
+  EOF, then ClosePseudoConsole, then outRead and hProcess. Error paths
+  in openPty close what was opened before raising. Also fixed win.nim:
+  pruned every declaration winlean already has (COORD, OpenProcess,
+  GetConsoleMode, SetConsoleMode, SetEvent, WSACreateEvent,
+  WSAEventSelect, CreateFileW, CreateEventW, and the ENABLE_/FD_/
+  GENERIC_/FILE_SHARE_/CREATE_NEW/PROCESS_TERMINATE consts); they were
+  ambiguous with winlean's camelCase versions at any use site.
+  Verified: posix build + nimble test + nimble example green; windows
+  check clean on pty.nim and win.nim.
 - [ ] 3. **Transport, discovery, protocol unification.** protocol.nim:
   sendMsg/readFull use send/recv; setNonBlocking branches to
   ioctlsocket; keep one-send-per-frame. runtime.nim: runtimeDir falls

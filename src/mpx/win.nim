@@ -1,6 +1,7 @@
 # The one raw Win32 import layer for mpx. No other module declares Win32
 # procs: they import this one and get std/winlean's basics re-exported
-# alongside the ConPTY, console, event, thread, file and winsock pieces
+# (including its camelCase console/event/winsock pieces) alongside the
+# ConPTY, startup-attribute, screen-buffer, thread and ioctlsocket pieces
 # winlean lacks. Dynlib procs bind lazily, so a binary still starts on
 # Windows 10 pre-1809 and fails only where ConPTY is actually used.
 
@@ -12,10 +13,6 @@ const
   ws2_32 = "ws2_32"
 
 type
-  COORD* = object
-    x*: SHORT
-    y*: SHORT
-
   HPCON* = Handle
 
   LPPROC_THREAD_ATTRIBUTE_LIST* = pointer
@@ -66,22 +63,15 @@ proc UpdateProcThreadAttribute*(lpAttributeList: LPPROC_THREAD_ATTRIBUTE_LIST,
                                 lpValue: pointer, cbSize: uint,
                                 lpPreviousValue: pointer,
                                 lpReturnSize: ptr uint): WINBOOL {.
-    stdcall, dynlib: kernel32, importc: "UpdateProcThreadAttribute".}
+                                stdcall, dynlib: kernel32,
+                                importc: "UpdateProcThreadAttribute".}
 
 proc DeleteProcThreadAttributeList*(lpAttributeList: LPPROC_THREAD_ATTRIBUTE_LIST) {.
-    stdcall, dynlib: kernel32, importc: "DeleteProcThreadAttributeList".}
+                          stdcall, dynlib: kernel32,
+                          importc: "DeleteProcThreadAttributeList".}
 
-proc OpenProcess*(dwDesiredAccess: DWORD, bInheritHandle: WINBOOL,
-                  dwProcessId: DWORD): Handle {.
-                  stdcall, dynlib: kernel32, importc: "OpenProcess".}
-
-# Console (kernel32)
-
-proc GetConsoleMode*(hConsoleHandle: Handle, lpMode: ptr DWORD): WINBOOL {.
-                       stdcall, dynlib: kernel32, importc: "GetConsoleMode".}
-
-proc SetConsoleMode*(hConsoleHandle: Handle, dwMode: DWORD): WINBOOL {.
-                       stdcall, dynlib: kernel32, importc: "SetConsoleMode".}
+# Console (kernel32). GetConsoleMode/SetConsoleMode/readConsoleInput and
+# the ENABLE_ flags come from winlean; the screen-buffer query does not.
 
 proc GetConsoleScreenBufferInfo*(
     hConsoleOutput: Handle,
@@ -90,37 +80,14 @@ proc GetConsoleScreenBufferInfo*(
 
 # Events and threads (kernel32)
 
-proc CreateEventW*(lpEventAttributes: ptr SECURITY_ATTRIBUTES,
-                   bManualReset, bInitialState: WINBOOL,
-                   lpName: WideCString): Handle {.
-                   stdcall, dynlib: kernel32, importc: "CreateEventW".}
-
-proc SetEvent*(hEvent: Handle): WINBOOL {.
-                stdcall, dynlib: kernel32, importc: "SetEvent".}
-
 proc CreateThread*(lpThreadAttributes: ptr SECURITY_ATTRIBUTES,
                    dwStackSize: uint, lpStartAddress: ThreadProc,
                    lpParameter: pointer, dwCreationFlags: DWORD,
                    lpThreadId: ptr DWORD): Handle {.
                    stdcall, dynlib: kernel32, importc: "CreateThread".}
 
-# Files (kernel32). CREATE_NEW is the O_EXCL equivalent used for the
-# session-lock claim.
-
-proc CreateFileW*(lpFileName: WideCString, dwDesiredAccess, dwShareMode: DWORD,
-                  lpSecurityAttributes: ptr SECURITY_ATTRIBUTES,
-                  dwCreationDisposition, dwFlagsAndAttributes: DWORD,
-                  hTemplateFile: Handle): Handle {.
-                  stdcall, dynlib: kernel32, importc: "CreateFileW".}
-
-# Winsock (ws2_32)
-
-proc WSACreateEvent*(): Handle {.
-                          stdcall, dynlib: ws2_32, importc: "WSACreateEvent".}
-
-proc WSAEventSelect*(s: SocketHandle, hEventObject: Handle,
-                     lNetworkEvents: clong): cint {.
-                     stdcall, dynlib: ws2_32, importc: "WSAEventSelect".}
+# Winsock (ws2_32): the event-select pair is in winlean, the nonblocking
+# ioctl is not.
 
 proc ioctlsocket*(s: SocketHandle, cmd: clong, argp: ptr culong): cint {.
                    stdcall, dynlib: ws2_32, importc: "ioctlsocket".}
@@ -133,28 +100,12 @@ const
   CREATE_NEW_PROCESS_GROUP* = 0x00000200'i32
   PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE* = 0x00020016'u
 
-  # Console mode flags
-  ENABLE_PROCESSED_INPUT* = 0x0001'i32
-  ENABLE_LINE_INPUT* = 0x0002'i32
-  ENABLE_ECHO_INPUT* = 0x0004'i32
-  ENABLE_VIRTUAL_TERMINAL_INPUT* = 0x0200'i32
-  ENABLE_PROCESSED_OUTPUT* = 0x0001'i32
-  ENABLE_VIRTUAL_TERMINAL_PROCESSING* = 0x0004'i32
+  # Pipe read errors meaning the far end is gone (EOF for our purposes)
+  ERROR_BROKEN_PIPE* = 109'i32
+  ERROR_NO_DATA* = 232'i32
 
-  # File access for the lock claim
-  GENERIC_WRITE* = 0x40000000'i32
-  FILE_SHARE_READ* = 0x00000001'i32
-  FILE_SHARE_WRITE* = 0x00000002'i32
-  CREATE_NEW* = 1'i32
-
-  # Process access rights
-  PROCESS_TERMINATE* = 0x0001'i32
-
-  # Winsock event selection / nonblocking ioctl
+  # Winsock nonblocking ioctl command
   FIONBIO* = clong(0x8004667)
-  FD_READ* = clong(0x00000001)
-  FD_WRITE* = clong(0x00000002)
-  FD_CLOSE* = clong(0x00000020)
 
 proc initWinsock*() =
   ## WSAStartup is refcounted per process; one call at startup covers every
