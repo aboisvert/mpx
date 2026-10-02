@@ -48,12 +48,14 @@ mpx attach
 # List sessions
 mpx ls
 
-# Detach: Ctrl-A d (screen style) or Ctrl-\ (dtach style)
+# Detach: Ctrl-G
 #
-# Ctrl-A is a prefix like screen's: Ctrl-A d detaches, Ctrl-A Ctrl-A
-# sends a literal Ctrl-A to the program, Ctrl-A <anything else> goes
-# through untouched. Ctrl-D is NOT a detach key: it is EOF, and it
-# reaches the program so shells, REPLs and pagers behave normally.
+# One key, no prefix, on the same key on every layout (a German keyboard
+# needs Ctrl-AltGr-\ for the old key, which is not a key, it's a finger
+# exercise). Ctrl-G collides with almost nothing: readline binds it to
+# an abort nobody presses on purpose, and dvtm uses it as its mod key.
+# Ctrl-D is NOT a detach key: it is EOF, and it reaches the program so
+# shells, REPLs and pagers behave normally.
 
 # Kill a session
 mpx kill main
