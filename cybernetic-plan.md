@@ -114,8 +114,27 @@ through mkAttach like the posix -l path; 56-client cap at accept
 (MaxClients, under the 64-handle ceiling); ptyEof (child exit) ends
 the session, cleanup sets stopEv and gives the writer 1s before
 closing handles. win.nim gained WSANETWORKEVENTS/WSAEnumNetworkEvents
-and GetCurrentProcessId (winlean has neither). client.nim stays
-posix-only until step 6. mpx.nim
+and GetCurrentProcessId (winlean has neither). client.nim has both
+platforms as of step 6: imports split the usual way (mpx/win plus
+session/atomics/os on Windows, posix/termios/selectors plus pty for
+Winsize elsewhere) and runClient is one export with a full body per
+platform, the daemon.nim runDaemon precedent. Windows side: connect =
+session.daemonPort + connectTcp(127.0.0.1, port) with cfg.listen's
+address as fallback when loopback refuses (a daemon started with -l off
+loopback never bound loopback), then mkAttach sent and mkAttached
+required before anything else; console modes saved on both handles,
+raw VT input (line/echo/processed cleared, ENABLE_VIRTUAL_TERMINAL_INPUT
+set), best-effort VT processing on output; no SIGWINCH, so a
+CreateThread poller samples GetConsoleScreenBufferInfo every 250ms,
+stashes w/h in Atomic[int]s seeded with the initial size (so the first
+sample emits no spurious resize) and pokes an auto-reset event; the
+loop is WaitForMultipleObjects over resize event, the waitable console
+input handle (readFile right after the wake, Ctrl-G lone-keypress
+detach unchanged) and one WSAEventSelect FD_READ/FD_CLOSE event
+(WSAEnumNetworkEvents as the reset); the socket is nonblocking once
+selected, so frames accumulate in a buffer and takeFrame peels the
+complete ones per wake; cleanup stops and joins the poller, restores
+both console modes, closes everything. mpx.nim
 doubles as of step 4: the std/posix import moved into the else branch
 of the `when defined(windows): import mpx/win` split; the no-command
 cmd comes from pty.defaultShell(); cleanSessionFiles/cleanStale/ls use
@@ -129,11 +148,18 @@ quoteArg, readiness = isActive or waitForSingleObject(pi.hProcess, 0)
 == WAIT_OBJECT_0; `kill` = openProcess(PROCESS_TERMINATE) on the pid
 file's pid + terminateProcess + the same stale sweep. Posix build/test
 (29 OK)/example green plus a manual new/ls/kill smoke; windows check
-clean on win, pty, protocol, runtime, session, daemon, and mpx.nim's
-own code; `nim check --os:windows` on src/mpx.nim now fails only in
-client.nim (posix-only termios/Winsize code, step 6's job). Note:
-Windows daemon threading is check-verified but not yet run on a real
-Windows box; step 7's tests are the first to exercise it.
+clean on win, pty, protocol, runtime, session, daemon, client, and
+mpx.nim's own code; as of step 6 `nim check --os:windows` on
+src/mpx.nim is fully clean, the whole binary checkable for the first
+time, plus a runtime smoke of the posix client (daemon, attach, Ctrl-G
+detach exit 0, kill, clean sweep). Windows runtime behavior (daemon
+threading and client console layer both) is check-verified but not yet
+run on a real Windows box; step 7's tests are the first to exercise
+it. One pre-existing bug surfaced by the smoke and present at HEAD
+before step 6: `new` keeps only rest[1] as the command, so multi-word
+commands drop their arguments (`mpx new sleep 30` execs a bare `sleep`,
+which dies, which fails the readiness poll); fix as a standalone
+commit or alongside step 7.
 
 ## Steps
 
@@ -263,14 +289,35 @@ Windows box; step 7's tests are the first to exercise it.
   daemon.nim, and src/mpx.nim now checks clean except client.nim
   (step 6). Windows runtime behavior is still unexercised: no real
   Windows box until step 7's tests.
-- [ ] 6. **client.nim Windows console layer.** Save console modes; raw
-  VT input (clear line/echo/processed, set VT input), best-effort VT
-  processing on output; resize poller thread (250ms, console screen
-  buffer info, SetEvent + stash w/h); loop waits on console input handle
-  + socket event + resize event; Ctrl-G lone-keypress detach unchanged;
-  restore modes on exit. Verify: posix suite green; check --os:windows
-  clean on client.nim; from here `nim check --os:windows` on
-  src/mpx.nim must be clean too.
+- [x] 6. **client.nim Windows console layer.** Done. Imports split the
+  pty.nim way and runClient is one export with a full body per platform
+  (daemon.nim's runDaemon precedent); the posix body is unchanged, with
+  the pty import moved into the posix branch (Winsize; unused on
+  Windows). Connect: session.daemonPort + connectTcp(127.0.0.1, port),
+  cfg.listen's address as fallback when loopback refuses, then mkAttach
+  sent and mkAttached required before anything else, since every client
+  on Windows arrives over TCP. Console: both handles' modes saved;
+  input raw VT (clear line/echo/processed, set
+  ENABLE_VIRTUAL_TERMINAL_INPUT) so keys arrive as the escape sequences
+  a posix terminal sends; output best-effort VT processing. Resize: a
+  CreateThread poller samples GetConsoleScreenBufferInfo every 250ms
+  (there is no SIGWINCH on Windows), stashes w/h into Atomic[int]s and
+  pokes an auto-reset event; the stash is seeded with the initial size
+  so the poller's first sample emits no redundant resize. Loop:
+  WaitForMultipleObjects over the resize event, the console input
+  handle (waitable; readFile right after the wake, Ctrl-G lone-keypress
+  detach identical to posix) and a WSAEventSelect FD_READ or FD_CLOSE
+  event reset by WSAEnumNetworkEvents. wsaEventSelect forces the socket
+  nonblocking, so daemon frames accumulate in a buffer and takeFrame
+  peels complete ones per wake instead of recvMsg blocking mid-frame;
+  the attach exchange runs before the event select precisely because
+  it needs blocking reads. Cleanup: stop flag, 1s join of the poller,
+  restore both console modes, close handles and socket. Verified: posix
+  build + nimble test (29 OK) + nimble example green plus a manual
+  smoke (daemon cat session, attach, Ctrl-G detach exit 0, kill, clean
+  sweep); check --os:windows clean on client.nim and, for the first
+  time, on src/mpx.nim as a whole. Windows runtime behavior of daemon
+  and client both stays unexercised until step 7.
 - [ ] 7. **Tests and example.** Read tests/test1.nim and example/
   example.nim first, then extend: windows branches exercise openPty +
   ConPTY roundtrip with the resolved shell and daemon-over-loopback at
