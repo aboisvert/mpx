@@ -86,11 +86,24 @@ proc CreateThread*(lpThreadAttributes: ptr SECURITY_ATTRIBUTES,
                    lpThreadId: ptr DWORD): Handle {.
                    stdcall, dynlib: kernel32, importc: "CreateThread".}
 
+proc GetCurrentProcessId*(): DWORD {.
+  stdcall, dynlib: kernel32, importc: "GetCurrentProcessId".}
+
 # Winsock (ws2_32): the event-select pair is in winlean, the nonblocking
-# ioctl is not.
+# ioctl and the enum-reset that goes with event select are not.
 
 proc ioctlsocket*(s: SocketHandle, cmd: clong, argp: ptr culong): cint {.
                    stdcall, dynlib: ws2_32, importc: "ioctlsocket".}
+
+type
+  WSANETWORKEVENTS* = object
+    lNetworkEvents*: clong
+    iErrorCode*: array[10, cint]
+
+proc WSAEnumNetworkEvents*(s: SocketHandle, hEventObject: Handle,
+                           lpNetworkEvents: ptr WSANETWORKEVENTS): cint {.
+                           stdcall, dynlib: ws2_32,
+                           importc: "WSAEnumNetworkEvents".}
 
 proc htons*(a1: uint16): uint16 {.
                stdcall, dynlib: ws2_32, importc: "htons".}

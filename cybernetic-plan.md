@@ -28,6 +28,11 @@ Decisions already made, do not relitigate:
   written by a blocking writer thread (queues + events). Anonymous pipes
   are not selectable; threads are the honest translation of epoll here.
 - **MAXIMUM_WAIT_OBJECTS is 64**: cap attached clients at 56 on Windows.
+- **Windows daemon has one TCP listener, not two**: there is no unix
+  socket to mirror, so the listener is the endpoint. It binds
+  127.0.0.1:4534 by default (first free port upward) and cfg.listen
+  moves it off loopback, same as -l on posix; the port lands in the
+  .port file either way, and every client is mkAttach-vetted.
 - **Client on Windows**: console mode raw VT input, resize detected by a
   250ms poller thread (there is no SIGWINCH on Windows), loop waits on
   console input handle (waitable) + socket event + resize event. Ctrl-G
@@ -54,7 +59,7 @@ push, no nimble install after commits.
 
 ## Current State
 
-Steps 1-3 done. `src/mpx/win.nim` is the one import layer: it re-exports
+Steps 1-5 done. `src/mpx/win.nim` is the one import layer: it re-exports
 std/winlean and declares what winlean genuinely lacks (ConPTY trio +
 HPCON, STARTUPINFOEXW + attribute-list procs,
 GetConsoleScreenBufferInfo and its types, CreateThread,
@@ -90,7 +95,27 @@ candidate"; windows-only daemonPort parses the .port file; isActive on
 Windows = port in range + connectTcp to 127.0.0.1 succeeds. mpx.nim
 calls initWinsock() as the first statement of main() on Windows.
 
-daemon.nim and client.nim stay posix-only until steps 5-6. mpx.nim
+daemon.nim compiles on both platforms as of step 5: the selector lives
+inside Session (posix-only field), the shared client machinery
+(flush/queue/broadcast/snapshot/handleClientMsg/feedClient, the loop's
+frame parsing and mkAttach vetting factored into feedClient) is written
+once against that, and each platform fills in the I/O edges. Windows
+side: reader thread blocks in ReadFile into a shared buffer guarded by
+a spinlock (Atomic[bool] exchange) and sets an auto-reset data event;
+writer thread waits [stopEv, inEv] and drains the input queue with
+blocking WriteFile; the loop is WaitForMultipleObjects over stopEv,
+dataEv, the listener event, and one WSAEventSelect event per client
+(FD_READ or FD_WRITE or FD_CLOSE, WSAEnumNetworkEvents as the reset),
+with outq would-block handled by edge-triggered FD_WRITE instead of
+posix's setInterest rearming. Transport is a single TCP listener:
+127.0.0.1:4534 base by default (cfg.listen overrides, same scan), port
+recorded in the .port file alongside the .pid; every client is vetted
+through mkAttach like the posix -l path; 56-client cap at accept
+(MaxClients, under the 64-handle ceiling); ptyEof (child exit) ends
+the session, cleanup sets stopEv and gives the writer 1s before
+closing handles. win.nim gained WSANETWORKEVENTS/WSAEnumNetworkEvents
+and GetCurrentProcessId (winlean has neither). client.nim stays
+posix-only until step 6. mpx.nim
 doubles as of step 4: the std/posix import moved into the else branch
 of the `when defined(windows): import mpx/win` split; the no-command
 cmd comes from pty.defaultShell(); cleanSessionFiles/cleanStale/ls use
@@ -104,9 +129,11 @@ quoteArg, readiness = isActive or waitForSingleObject(pi.hProcess, 0)
 == WAIT_OBJECT_0; `kill` = openProcess(PROCESS_TERMINATE) on the pid
 file's pid + terminateProcess + the same stale sweep. Posix build/test
 (29 OK)/example green plus a manual new/ls/kill smoke; windows check
-clean on win, pty, protocol, runtime, session, and mpx.nim's own code
-(its only diagnostics are the runDaemon cascade from daemon.nim's
-posix-only compile, pre-existing there and step 5's to fix).
+clean on win, pty, protocol, runtime, session, daemon, and mpx.nim's
+own code; `nim check --os:windows` on src/mpx.nim now fails only in
+client.nim (posix-only termios/Winsize code, step 6's job). Note:
+Windows daemon threading is check-verified but not yet run on a real
+Windows box; step 7's tests are the first to exercise it.
 
 ## Steps
 
@@ -206,16 +233,36 @@ posix-only compile, pre-existing there and step 5's to fix).
   being the pre-existing runDaemon cascade from daemon.nim's
   posix-only compile (step 5's job), and still clean on win, pty,
   protocol, runtime, session.
-- [ ] 5. **daemon.nim Windows event loop.** Reader thread: blocking
-  ReadFile on the ConPTY output pipe, appends chunks to a shared buffer,
-  SetEvent. Writer thread: waits on an input event, drains the input
-  queue with blocking WriteFile. Main loop: WaitForMultipleObjects over
-  stop event, pty-data event, listen + tcp + client socket events
-  (WSAEventSelect), mirroring the posix loop's accept/vet/snapshot/
-  broadcast/outq logic (nonblocking send, queue on would-block). Child
-  exit ends the session as today (read side sees broken pipe). 56-client
-  cap enforced at accept. Verify: posix suite green; check --os:windows
-  clean on daemon.nim.
+- [x] 5. **daemon.nim Windows event loop.** Done. The selector moved
+  inside Session as a posix-only field so the shared client machinery
+  (flushClient/queueClient/broadcast/queueSnapshot/flushPty/handleClientMsg)
+  is written once; the loop's inline frame parsing and mkAttach vetting
+  were factored into feedClient so both loops share them; addClient/
+  dropClient/setInterest carry the platform edges. Reader thread blocks
+  in ReadFile, appends to ptyOut under a spinlock (Atomic[bool]
+  exchange/clear), sets an auto-reset data event; on EOF (broken pipe
+  after child exit) it sets ptyEof and pokes the event again. Writer
+  thread waits [stopEv, inEv], moves the whole input queue out under
+  the spinlock, writes it fully with blocking WriteFile (backpressure
+  parks there, not in the loop). Main loop: WaitForMultipleObjects over
+  stopEv, dataEv, one FD_ACCEPT listener event and one per-client
+  WSAEventSelect event, reset via WSAEnumNetworkEvents; outq would-block
+  rides edge-triggered FD_WRITE (no setInterest equivalent needed);
+  the data handler drains the chunk before the eof check so the child's
+  last output is not lost when chunk and eof coalesce into one wake.
+  Transport: single TCP listener, 127.0.0.1:4534 base by default,
+  cfg.listen overrides (same startTcpListener scan), port written to
+  the .port file, pid via GetCurrentProcessId next to it; every client
+  is TCP-vetted through mkAttach; 56-client cap (MaxClients) at accept;
+  cleanup sets stopEv, waits up to 1s for the writer, then closes
+  clients/listener/events and sweeps .port/.pid/.lock. startTcpListener
+  now takes (ip, basePort) instead of (sessionName, cfg). win.nim
+  gained WSANETWORKEVENTS + WSAEnumNetworkEvents and GetCurrentProcessId.
+  Verified: posix build + nimble test (29 OK) + nimble example green
+  plus a manual daemon/ls/kill smoke; check --os:windows clean on
+  daemon.nim, and src/mpx.nim now checks clean except client.nim
+  (step 6). Windows runtime behavior is still unexercised: no real
+  Windows box until step 7's tests.
 - [ ] 6. **client.nim Windows console layer.** Save console modes; raw
   VT input (clear line/echo/processed, set VT input), best-effort VT
   processing on output; resize poller thread (250ms, console screen
