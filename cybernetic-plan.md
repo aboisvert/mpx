@@ -90,16 +90,23 @@ candidate"; windows-only daemonPort parses the .port file; isActive on
 Windows = port in range + connectTcp to 127.0.0.1 succeeds. mpx.nim
 calls initWinsock() as the first statement of main() on Windows.
 
-daemon.nim, client.nim and the rest of mpx.nim stay posix-only until
-steps 4-6. Notes for step 4: mpx.nim still resolves the shell itself
-(getEnv SHELL, /bin/sh), so the Windows spawn rewire must route the
-no-command case through defaultShell() or pass an empty cmd;
-cleanSessionFiles/cleanStale/ls hardcode ".sock" and must move to the
-.port world; kill uses posix.kill/waitpid, to become
-TerminateProcess/WaitForSingleObject; pathPresent uses lstat because
-fileExists is false for sockets, but a .port file is a regular file so
-plain fileExists works on Windows. Posix build/test (29 OK)/example
-green; windows check clean on win, pty, protocol, runtime, session.
+daemon.nim and client.nim stay posix-only until steps 5-6. mpx.nim
+doubles as of step 4: the std/posix import moved into the else branch
+of the `when defined(windows): import mpx/win` split; the no-command
+cmd comes from pty.defaultShell(); cleanSessionFiles/cleanStale/ls use
+session's now-exported EndpointExt (.port on Windows) instead of a
+hardcoded ".sock"; pathPresent is plain fileExists on Windows (a
+.port file is regular, lstat stays for sockets); `new` daemonizes on
+Windows via createProcessW with DETACHED_PROCESS or
+CREATE_BREAKAWAY_FROM_JOB or CREATE_NEW_PROCESS_GROUP over the same
+args list the fork path execvs, quoted through pty's now-exported
+quoteArg, readiness = isActive or waitForSingleObject(pi.hProcess, 0)
+== WAIT_OBJECT_0; `kill` = openProcess(PROCESS_TERMINATE) on the pid
+file's pid + terminateProcess + the same stale sweep. Posix build/test
+(29 OK)/example green plus a manual new/ls/kill smoke; windows check
+clean on win, pty, protocol, runtime, session, and mpx.nim's own code
+(its only diagnostics are the runDaemon cascade from daemon.nim's
+posix-only compile, pre-existing there and step 5's to fix).
 
 ## Steps
 
@@ -178,13 +185,27 @@ green; windows check clean on win, pty, protocol, runtime, session.
   protocol, runtime, session, and win/pty still clean. mpx.nim's own
   Windows branch stays check-unverifiable until steps 4-6 gate
   daemon/client, as the plan already expected.
-- [ ] 4. **mpx.nim Windows spawn/kill.** The `new` path daemonize step:
-  CreateProcessW (detached, breakaway, new process group) instead of
-  fork/execv; readiness loop polls isActive plus
-  WaitForSingleObject(pid, 0) for early exit; `kill`: TerminateProcess
-  via OpenProcess on the pid from the pid file, then the existing stale
-  sweep; `ls`: walk mpxDir for .port files instead of .sock. Verify:
-  posix suite green; check --os:windows clean on mpx.nim.
+- [x] 4. **mpx.nim Windows spawn/kill.** Done. `new` daemonizes on
+  Windows with createProcessW (DETACHED_PROCESS or
+  CREATE_BREAKAWAY_FROM_JOB or CREATE_NEW_PROCESS_GROUP) over the same
+  args list the fork path execvs, quoted via pty.quoteArg (now
+  exported); hThread closed at once, readiness polls isActive plus
+  waitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0 for early exit,
+  hProcess closed after. `kill` opens the pid-file pid with
+  openProcess(PROCESS_TERMINATE), terminateProcess, closeHandle, then
+  the same sleep(100) + cleanSessionFiles sweep; the posix
+  kill/waitpid branch is unchanged. `ls` and
+  cleanSessionFiles/cleanStale use the now-exported session.EndpointExt
+  instead of ".sock"; pathPresent is plain fileExists on Windows (a
+  .port file is regular, lstat stays for sockets); the no-command cmd
+  routes through pty.defaultShell(); mpx.nim's std/posix import moved
+  into the else branch of the win split. Verified: posix build +
+  nimble test (29 OK) + nimble example green plus a manual
+  new/ls/kill smoke (daemonize, list, kill, sweep, no leftovers);
+  check --os:windows clean on mpx.nim's own code, its only diagnostics
+  being the pre-existing runDaemon cascade from daemon.nim's
+  posix-only compile (step 5's job), and still clean on win, pty,
+  protocol, runtime, session.
 - [ ] 5. **daemon.nim Windows event loop.** Reader thread: blocking
   ReadFile on the ConPTY output pipe, appends chunks to a shared buffer,
   SetEvent. Writer thread: waits on an input event, drains the input

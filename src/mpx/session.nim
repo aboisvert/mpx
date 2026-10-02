@@ -8,9 +8,9 @@ else:
   import std/posix
 
 when defined(windows):
-  const EndpointExt = ".port"
+  const EndpointExt* = ".port"
 else:
-  const EndpointExt = ".sock"
+  const EndpointExt* = ".sock"
 
 proc defaultName*(): string =
   ## Sessions started without a name are named after the current directory.

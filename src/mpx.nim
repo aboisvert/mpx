@@ -1,8 +1,10 @@
-import std/[os, posix, strutils, sequtils]
-import mpx/[daemon, client, protocol, session, cli, runtime]
+import std/[os, strutils, sequtils]
+import mpx/[daemon, client, protocol, session, cli, runtime, pty]
 
 when defined(windows):
   import mpx/win
+else:
+  import std/posix
 
 const
   Version = staticRead("../mpx.nimble").splitLines.filterIt(it.startsWith("version"))[0].split('=')[1].strip().strip(chars={' ', '"'})
@@ -33,12 +35,16 @@ proc die*(msg: string) =
   quit(1)
 
 proc pathPresent(p: string): bool =
-  # fileExists is false for sockets; lstat only says the path is there
-  var st: Stat
-  lstat(p.cstring, st) == 0
+  # fileExists is false for sockets; lstat only says the path is there.
+  # A .port file is a regular file, so plain fileExists works.
+  when defined(windows):
+    fileExists(p)
+  else:
+    var st: Stat
+    lstat(p.cstring, st) == 0
 
 proc cleanSessionFiles(sessionName: string) =
-  for ext in [".sock", ".lock", ".pid"]:
+  for ext in [EndpointExt, ".lock", ".pid"]:
     let p = socketPath(sessionName).changeFileExt(ext)
     if pathPresent(p):
       try:
@@ -48,7 +54,7 @@ proc cleanSessionFiles(sessionName: string) =
 
 proc cleanStale(sessionName: string) =
   var stale = false
-  for ext in [".sock", ".lock", ".pid"]:
+  for ext in [EndpointExt, ".lock", ".pid"]:
     if pathPresent(socketPath(sessionName).changeFileExt(ext)):
       stale = true
       break
@@ -86,7 +92,7 @@ proc main() =
       rest = opts.sessions
 
   var sessionName = if rest.len > 0: rest[0] else: ""
-  var cmd = if rest.len > 1: rest[1] else: getEnv("SHELL", "/bin/sh")
+  var cmd = if rest.len > 1: rest[1] else: defaultShell()
 
   case mode
   of "daemon", "new":
@@ -141,39 +147,70 @@ proc main() =
         args.add(["-p", $opts.port])
       if opts.log:
         args.add("--log")
-      let pid = fork()
-      if pid == 0:
-        # Detach from the client's session: the daemon must survive the
-        # terminal closing (SIGHUP to the foreground process group)
-        discard setsid()
-        # And from its fds: a daemon holding the spawning terminal or a
-        # script's pipes open keeps ssh logouts and pipe readers waiting.
-        # The socket is the daemon's only interface.
-        let nfd = posix.open("/dev/null", O_RDWR)
-        if nfd >= 0:
-          discard dup2(nfd, 0)
-          discard dup2(nfd, 1)
-          discard dup2(nfd, 2)
-          if nfd > 2:
-            discard posix.close(nfd)
-        for i in 3 .. 1023:
-          discard posix.close(cint(i))
-        discard execv(exe.cstring, allocCStringArray(args))
-        die("exec failed: " & exe)
-      # The daemon runs in the foreground forever; wait for its socket,
-      # not for the process. WNOHANG catches an early exit (bad cmd, bind
-      # failure) so it surfaces instead of hanging until the timeout.
-      var ready = false
-      var status: cint = 0
-      for i in 1 .. 100:
-        if isActive(sessionName):
-          ready = true
-          break
-        if posix.waitpid(pid, status, WNOHANG) == pid:
-          break
-        sleep(50)
-      if not ready:
-        die("daemon failed to start: " & sessionName)
+      when defined(windows):
+        # Same detachment the posix fork path earns with setsid: no
+        # console at all, free of any job the spawning terminal put us
+        # in, its own group so a Ctrl-C in the client cannot reach it.
+        var si = STARTUPINFO()
+        si.cb = int32(sizeof(STARTUPINFO))
+        var pi = PROCESS_INFORMATION()
+        if createProcessW(newWideCString(exe),
+                          newWideCString(args.mapIt(quoteArg(it)).join(" ")),
+                          nil, nil, 0,
+                          DETACHED_PROCESS or CREATE_BREAKAWAY_FROM_JOB or
+                          CREATE_NEW_PROCESS_GROUP,
+                          nil, nil, si, pi) == 0:
+          die("CreateProcessW failed for daemon: " & $getLastError())
+        discard closeHandle(pi.hThread)
+        # The daemon runs in the foreground forever; wait for its port
+        # file, not for the process. A signaled handle catches an early
+        # exit (bad cmd, bind failure) so it surfaces instead of hanging
+        # until the timeout.
+        var ready = false
+        for i in 1 .. 100:
+          if isActive(sessionName):
+            ready = true
+            break
+          if waitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0:
+            break
+          sleep(50)
+        discard closeHandle(pi.hProcess)
+        if not ready:
+          die("daemon failed to start: " & sessionName)
+      else:
+        let pid = fork()
+        if pid == 0:
+          # Detach from the client's session: the daemon must survive the
+          # terminal closing (SIGHUP to the foreground process group)
+          discard setsid()
+          # And from its fds: a daemon holding the spawning terminal or a
+          # script's pipes open keeps ssh logouts and pipe readers waiting.
+          # The socket is the daemon's only interface.
+          let nfd = posix.open("/dev/null", O_RDWR)
+          if nfd >= 0:
+            discard dup2(nfd, 0)
+            discard dup2(nfd, 1)
+            discard dup2(nfd, 2)
+            if nfd > 2:
+              discard posix.close(nfd)
+          for i in 3 .. 1023:
+            discard posix.close(cint(i))
+          discard execv(exe.cstring, allocCStringArray(args))
+          die("exec failed: " & exe)
+        # The daemon runs in the foreground forever; wait for its socket,
+        # not for the process. WNOHANG catches an early exit (bad cmd, bind
+        # failure) so it surfaces instead of hanging until the timeout.
+        var ready = false
+        var status: cint = 0
+        for i in 1 .. 100:
+          if isActive(sessionName):
+            ready = true
+            break
+          if posix.waitpid(pid, status, WNOHANG) == pid:
+            break
+          sleep(50)
+        if not ready:
+          die("daemon failed to start: " & sessionName)
     try:
       runClient(sessionName, cfg)
     except CatchableError:
@@ -183,7 +220,7 @@ proc main() =
     let dir = mpxDir()
     if dirExists(dir):
       for (_, f) in walkDir(dir):
-        if f.endsWith(".sock"):
+        if f.endsWith(EndpointExt):
           let name = f.extractFilename.changeFileExt("")
           # A killed daemon can leave a socket behind: list only sessions
           # that still answer
@@ -194,14 +231,31 @@ proc main() =
       # Daemon is gone; leftover files are stale garbage, clean them
       cleanStale(sessionName)
     let pid = daemonPid(sessionName)
-    if pid != 0 and posix.kill(pid.Pid, SIGTERM) == 0:
-      echo "killed ", pid
-      # Daemon cleanup runs on graceful exit; sweep whatever remains so
-      # a crashed daemon leaves nothing behind
-      sleep(100)
-      cleanSessionFiles(sessionName)
+    when defined(windows):
+      # TerminateProcess is blunt, but a detached daemon has no console
+      # to post a graceful close to; the sweep below is the cleanup a
+      # graceful exit would have done.
+      var killed = false
+      if pid != 0:
+        let h = openProcess(PROCESS_TERMINATE, 0, pid.DWORD)
+        if h != 0:
+          killed = terminateProcess(h, 1) != 0
+          discard closeHandle(h)
+      if killed:
+        echo "killed ", pid
+        sleep(100)
+        cleanSessionFiles(sessionName)
+      else:
+        die("no daemon found for session: " & sessionName)
     else:
-      die("no daemon found for session: " & sessionName)
+      if pid != 0 and posix.kill(pid.Pid, SIGTERM) == 0:
+        echo "killed ", pid
+        # Daemon cleanup runs on graceful exit; sweep whatever remains so
+        # a crashed daemon leaves nothing behind
+        sleep(100)
+        cleanSessionFiles(sessionName)
+      else:
+        die("no daemon found for session: " & sessionName)
   else:
     die("unknown command: " & mode & ". " & UsageHint)
 

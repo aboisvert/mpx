@@ -117,7 +117,7 @@ else:
                         # WaitForSingleObject on it instead of fishing
                         # the exit out of the read side
 
-  proc quoteArg(s: string): string =
+  proc quoteArg*(s: string): string =
     # Minimal Windows quoting: an argument with spaces, tabs or quotes
     # gets wrapped, embedded quotes doubled. Full CRT rules are more
     # ceremony than the command lines mpx builds ever need.
