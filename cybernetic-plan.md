@@ -54,34 +54,52 @@ push, no nimble install after commits.
 
 ## Current State
 
-Steps 1-2 done. `src/mpx/win.nim` is the one import layer, now pruned:
-it re-exports std/winlean and only declares what winlean genuinely lacks
-(ConPTY trio + HPCON, STARTUPINFOEXW + attribute-list procs,
-GetConsoleScreenBufferInfo + CONSOLE_SCREEN_BUFFER_INFO/SMALL_RECT,
-CreateThread + ThreadProc, ioctlsocket + FIONBIO,
-EXTENDED_STARTUPINFO_PRESENT, CREATE_BREAKAWAY_FROM_JOB,
-CREATE_NEW_PROCESS_GROUP, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-ERROR_BROKEN_PIPE/ERROR_NO_DATA, initWinsock). Step 2 discovered
-winlean already had COORD, openProcess, createEvent, setEvent,
-Get/SetConsoleMode, readConsoleInput, wsaCreateEvent/wsaEventSelect,
-createFileW and the ENABLE_, FD_, GENERIC_, FILE_SHARE_, CREATE_NEW,
-PROCESS_TERMINATE consts under camelCase names; the duplicates were
-removed because Nim's style-insensitive lookup made them ambiguous at
-every use site. Callers of win.nim use winlean's camelCase spellings
-(createEvent, setEvent, openProcess, createFileW, wsaEventSelect,
-getConsoleMode, and so on) via the re-export; winlean's FD_* consts are
-int32 while wsaEventSelect wants clong, which widens fine.
-`src/mpx/pty.nim` now has both branches behind one API: defaultShell()
-(SHELL on posix, pwsh/powershell/cmd probe on Windows, empty cmd means
-default shell), openPty/setSize/read/write/close; the Windows Pty
-carries hpc/inWrite/outRead/hProcess, read and write are blocking
-ReadFile/WriteFile and broken-pipe reads return 0 as EOF. Nothing
-imports win.nim on posix yet; posix build/test/example green; windows
-check clean on win.nim and pty.nim. daemon/client/protocol/session/
-mpx are still posix-only until steps 3-6. Note for step 4: mpx.nim
-still resolves the shell itself (getEnv SHELL, /bin/sh), so the
-Windows spawn rewire must route the no-command case through
-defaultShell() or pass an empty cmd.
+Steps 1-3 done. `src/mpx/win.nim` is the one import layer: it re-exports
+std/winlean and declares what winlean genuinely lacks (ConPTY trio +
+HPCON, STARTUPINFOEXW + attribute-list procs,
+GetConsoleScreenBufferInfo and its types, CreateThread,
+EXTENDED_STARTUPINFO_PRESENT,
+CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP,
+PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, ERROR_BROKEN_PIPE/ERROR_NO_DATA,
+initWinsock). Step 3 found winlean has neither SOCK_STREAM nor htons at
+all, so win.nim supplies those too now (SOCK_STREAM = 1, a ws2_32
+htons). Callers of mpx/win use winlean's camelCase spellings
+(createEvent, setEvent, openProcess, createFileW with GENERIC_WRITE/
+FILE_SHARE_*/CREATE_NEW/FILE_ATTRIBUTE_NORMAL, wsaEventSelect,
+getConsoleMode, and so on) via the re-export; winlean's
+ERROR_FILE_EXISTS (80) covers the lock-claim retry.
+
+`src/mpx/pty.nim` has both branches behind one API: defaultShell()
+($SHELL on posix, pwsh/powershell/cmd probe on Windows, empty cmd means
+default shell), openPty/setSize/read/write/close, the Windows Pty
+carrying hpc/inWrite/outRead/hProcess with blocking ReadFile/WriteFile.
+
+protocol.nim compiles on both platforms as of step 3: imports split the
+pty.nim way (`when defined(windows): import mpx/win else: import
+std/posix`), sendMsg/readFull use send/recv (posix EINTR retry kept
+behind a wasInterrupted helper since winsock has no signal
+interruption), a private sockClose wraps closeSocket/posix.close,
+setNonBlocking uses ioctlsocket(FIONBIO) on Windows, connectUnix is
+posix-only, connectTcp/listenTcp compile everywhere (sin_family branches
+AF_INET vs TSa_Family), socketPath names the `.port` endpoint file on
+Windows. runtime.nim: %TEMP% then %LOCALAPPDATA%/Temp on Windows.
+session.nim: an EndpointExt const (.port vs .sock) drives
+resolveSession's existence check and oldestSession's walk; the lock
+claim uses createFileW(CREATE_NEW) with ERROR_FILE_EXISTS meaning "next
+candidate"; windows-only daemonPort parses the .port file; isActive on
+Windows = port in range + connectTcp to 127.0.0.1 succeeds. mpx.nim
+calls initWinsock() as the first statement of main() on Windows.
+
+daemon.nim, client.nim and the rest of mpx.nim stay posix-only until
+steps 4-6. Notes for step 4: mpx.nim still resolves the shell itself
+(getEnv SHELL, /bin/sh), so the Windows spawn rewire must route the
+no-command case through defaultShell() or pass an empty cmd;
+cleanSessionFiles/cleanStale/ls hardcode ".sock" and must move to the
+.port world; kill uses posix.kill/waitpid, to become
+TerminateProcess/WaitForSingleObject; pathPresent uses lstat because
+fileExists is false for sockets, but a .port file is a regular file so
+plain fileExists works on Windows. Posix build/test (29 OK)/example
+green; windows check clean on win, pty, protocol, runtime, session.
 
 ## Steps
 
@@ -132,16 +150,34 @@ defaultShell() or pass an empty cmd.
   ambiguous with winlean's camelCase versions at any use site.
   Verified: posix build + nimble test + nimble example green; windows
   check clean on pty.nim and win.nim.
-- [ ] 3. **Transport, discovery, protocol unification.** protocol.nim:
-  sendMsg/readFull use send/recv; setNonBlocking branches to
-  ioctlsocket; keep one-send-per-frame. runtime.nim: runtimeDir falls
-  back to %TEMP% (getEnv TEMP, then LOCALAPPDATA/Temp) on Windows.
-  session.nim: `when defined(windows)` discovery via `<name>.port` files
-  (isActive = port file parses + TCP connect to 127.0.0.1 succeeds;
-  oldestSession ranks .pid mtimes among sessions with a .port),
-  exclusive lock claim via CreateFileW CREATE_NEW. mpx.nim calls
-  initWinsock on Windows. Verify: build + nimble test + nimble example
-  green on posix; check --os:windows clean for these modules.
+- [x] 3. **Transport, discovery, protocol unification.** Done.
+  protocol.nim: imports split the pty.nim way (`when defined(windows):
+  import mpx/win else: import std/posix`); sendMsg/readFull call
+  send/recv with cint counts, one-send-per-frame kept; the EINTR retry
+  is posix-only behind a wasInterrupted helper (winsock has no signal
+  interruption); a private sockClose wraps closeSocket/posix.close for
+  error paths; setNonBlocking branches to ioctlsocket(FIONBIO,
+  culong 1); connectUnix is gated `when not defined(windows)`;
+  connectTcp/listenTcp compile on both platforms (sin_family from plain
+  AF_INET on Windows, AF_INET.TSa_Family on posix); socketPath returns
+  the `<name>.port` file on Windows. The step found winlean has neither
+  SOCK_STREAM nor htons at all, so win.nim gained SOCK_STREAM (1) and a
+  ws2_32 htons. runtime.nim: runtimeDir takes a Windows branch, %TEMP%
+  then %LOCALAPPDATA%/Temp, "." as last resort; module doc updated.
+  session.nim: posix import and unix-socket probe sit in the else
+  branch; an EndpointExt const (.port vs .sock) drives resolveSession's
+  existence check and oldestSession's dir walk; the lock claim uses
+  createFileW(GENERIC_WRITE, share read+write, CREATE_NEW,
+  FILE_ATTRIBUTE_NORMAL) with ERROR_FILE_EXISTS meaning "someone
+  claimed it, next candidate"; windows-only daemonPort* parses the
+  .port file; isActive on Windows = port in 1..65535 plus connectTcp
+  to 127.0.0.1 succeeding. mpx.nim: `when defined(windows): import
+  mpx/win` and initWinsock() as the first statement of main().
+  Verified: posix build + nimble test (29 OK) + nimble example green;
+  `nim check --hints:off --os:windows --cpu:amd64 --path:src` clean on
+  protocol, runtime, session, and win/pty still clean. mpx.nim's own
+  Windows branch stays check-unverifiable until steps 4-6 gate
+  daemon/client, as the plan already expected.
 - [ ] 4. **mpx.nim Windows spawn/kill.** The `new` path daemonize step:
   CreateProcessW (detached, breakaway, new process group) instead of
   fork/execv; readiness loop polls isActive plus

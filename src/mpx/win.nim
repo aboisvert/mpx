@@ -92,6 +92,9 @@ proc CreateThread*(lpThreadAttributes: ptr SECURITY_ATTRIBUTES,
 proc ioctlsocket*(s: SocketHandle, cmd: clong, argp: ptr culong): cint {.
                    stdcall, dynlib: ws2_32, importc: "ioctlsocket".}
 
+proc htons*(a1: uint16): uint16 {.
+               stdcall, dynlib: ws2_32, importc: "htons".}
+
 const
   # Process creation. EXTENDED_STARTUPINFO_PRESENT must accompany any
   # STARTUPINFOEXW or the attribute list is ignored.
@@ -106,6 +109,9 @@ const
 
   # Winsock nonblocking ioctl command
   FIONBIO* = clong(0x8004667)
+
+  # Winsock socket types (winlean has AF_* but not SOCK_*)
+  SOCK_STREAM* = 1'i32
 
 proc initWinsock*() =
   ## WSAStartup is refcounted per process; one call at startup covers every

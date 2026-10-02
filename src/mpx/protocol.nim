@@ -1,6 +1,10 @@
-import std/[posix, os, strutils, sequtils]
+import std/[os, strutils, sequtils]
 from std/net import parseIpAddress, IpAddress, IpAddressFamily
 import runtime
+when defined(windows):
+  import mpx/win
+else:
+  import std/posix
 
 type
   MsgKind* = enum
@@ -39,22 +43,36 @@ proc frameBytes*(kind: MsgKind, payload: openArray[byte]): seq[byte] =
   if payload.len > 0:
     copyMem(addr result[HeaderSize], unsafeAddr payload[0], payload.len)
 
+proc wasInterrupted(): bool =
+  ## Posix only: a signal can cut a send short. Winsock has no signal
+  ## interruption, so there a failed send is plain failure.
+  when defined(windows):
+    false
+  else:
+    errno == EINTR
+
+proc sockClose(fd: SocketHandle) =
+  when defined(windows):
+    discard closeSocket(fd)
+  else:
+    discard posix.close(fd)
+
 proc sendMsg*(fd: SocketHandle, kind: MsgKind,
              payload: openArray[byte] = []): bool =
-  ## Write one framed message, one write call per frame: a frame split
+  ## Write one framed message, one send call per frame: a frame split
   ## across two writes can be interleaved with another writer on the
   ## same fd, and the peer would read the length prefix out of sync.
-  ## Short writes (interrupted after partial transfer) are retried.
+  ## Short sends (interrupted after partial transfer) are retried.
   ## Returns false on a hard error (peer gone).
   if payload.len > MaxPayload:
     return false
   var buf = frameBytes(kind, payload)
   var sent = 0
   while sent < buf.len:
-    let w = posix.write(fd.cint, addr buf[sent], buf.len - sent)
+    let w = send(fd, addr buf[sent], cint(buf.len - sent), 0)
     if w > 0:
       inc(sent, w)
-    elif errno == EINTR:
+    elif w == -1 and wasInterrupted():
       continue
     else:
       return false
@@ -64,7 +82,7 @@ proc readFull*(fd: SocketHandle, buf: pointer, n: int): bool =
   ## Read exactly n bytes. False on EOF or error before n bytes arrived.
   var got = 0
   while got < n:
-    let r = posix.read(fd.cint, cast[pointer](cast[int](buf) + got), n - got)
+    let r = recv(fd, cast[pointer](cast[int](buf) + got), cint(n - got), 0)
     if r <= 0:
       return false
     inc(got, r)
@@ -91,8 +109,12 @@ proc takeFrame*(buf: var seq[byte], kind: var MsgKind,
   result = true
 
 proc setNonBlocking*(fd: SocketHandle) =
-  let fl = fcntl(fd.cint, F_GETFL)
-  discard fcntl(fd.cint, F_SETFL, fl or O_NONBLOCK)
+  when defined(windows):
+    var mode: culong = 1
+    discard ioctlsocket(fd, FIONBIO, addr mode)
+  else:
+    let fl = fcntl(fd.cint, F_GETFL)
+    discard fcntl(fd.cint, F_SETFL, fl or O_NONBLOCK)
 
 proc recvMsg*(fd: SocketHandle): tuple[kind: MsgKind, payload: seq[byte]] =
   var header: array[HeaderSize, byte]
@@ -111,7 +133,12 @@ proc recvMsg*(fd: SocketHandle): tuple[kind: MsgKind, payload: seq[byte]] =
       raise newException(IOError, "short read on message payload")
 
 proc socketPath*(sessionName: string): string =
-  mpxDir() / sessionName & ".sock"
+  ## The daemon's endpoint file: the unix socket path on posix, the .port
+  ## file carrying the loopback TCP port on Windows.
+  when defined(windows):
+    mpxDir() / sessionName & ".port"
+  else:
+    mpxDir() / sessionName & ".sock"
 
 proc removeSocket*(sessionName: string) =
   ## Remove a stale socket. Never removes the session lock file: the daemon
@@ -135,50 +162,57 @@ proc daemonPid*(sessionName: string): int =
   except CatchableError:
     0
 
-proc connectUnix*(path: string): SocketHandle =
-  let fd = posix.socket(AF_UNIX, SOCK_STREAM, 0)
-  if fd == SocketHandle(-1):
-    raise newException(OSError, "socket failed")
-  var saddr: Sockaddr_un
-  saddr.sun_family = AF_UNIX.TSa_Family
-  let pathCstr = path.cstring
-  if pathCstr.len >= saddr.sun_path.len:
-    discard posix.close(fd)
-    raise newException(OSError, "socket path too long")
-  copyMem(addr saddr.sun_path, pathCstr, pathCstr.len)
-  if connect(fd, cast[ptr SockAddr](addr saddr), sizeof(Sockaddr_un).SockLen) != 0:
-    discard posix.close(fd)
-    raise newException(OSError, "connect failed: " & path)
-  fd
+when not defined(windows):
+  proc connectUnix*(path: string): SocketHandle =
+    let fd = posix.socket(AF_UNIX, SOCK_STREAM, 0)
+    if fd == SocketHandle(-1):
+      raise newException(OSError, "socket failed")
+    var saddr: Sockaddr_un
+    saddr.sun_family = AF_UNIX.TSa_Family
+    let pathCstr = path.cstring
+    if pathCstr.len >= saddr.sun_path.len:
+      discard posix.close(fd)
+      raise newException(OSError, "socket path too long")
+    copyMem(addr saddr.sun_path, pathCstr, pathCstr.len)
+    if connect(fd, cast[ptr SockAddr](addr saddr), sizeof(Sockaddr_un).SockLen) != 0:
+      discard posix.close(fd)
+      raise newException(OSError, "connect failed: " & path)
+    fd
 
 proc connectTcp*(ip: IpAddress, port: int): SocketHandle =
-  let fd = posix.socket(AF_INET, SOCK_STREAM, 0)
+  let fd = socket(AF_INET, SOCK_STREAM, 0)
   if fd == SocketHandle(-1):
     raise newException(OSError, "socket failed")
   var saddr: Sockaddr_in
-  saddr.sin_family = AF_INET.TSa_Family
+  when defined(windows):
+    saddr.sin_family = AF_INET
+  else:
+    saddr.sin_family = AF_INET.TSa_Family
   saddr.sin_port = htons(uint16(port))
   saddr.sin_addr.s_addr = cast[uint32](ip.address_v4)
   if connect(fd, cast[ptr SockAddr](addr saddr), sizeof(Sockaddr_in).SockLen) != 0:
-    discard posix.close(fd)
+    sockClose(fd)
     raise newException(OSError, "connect failed: " & $ip & ":" & $port)
   fd
 
 proc listenTcp*(ip: IpAddress, port: int): SocketHandle =
   ## Bind and listen on ip:port. Raises OSError if the port is taken.
-  let fd = posix.socket(AF_INET, SOCK_STREAM, 0)
+  let fd = socket(AF_INET, SOCK_STREAM, 0)
   if fd == SocketHandle(-1):
     raise newException(OSError, "socket failed")
   var one: cint = 1
   discard setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, addr one, sizeof(one).SockLen)
   var saddr: Sockaddr_in
-  saddr.sin_family = AF_INET.TSa_Family
+  when defined(windows):
+    saddr.sin_family = AF_INET
+  else:
+    saddr.sin_family = AF_INET.TSa_Family
   saddr.sin_port = htons(uint16(port))
   saddr.sin_addr.s_addr = cast[uint32](ip.address_v4)
   if bindSocket(fd, cast[ptr SockAddr](addr saddr), sizeof(Sockaddr_in).SockLen) != 0:
-    discard posix.close(fd)
+    sockClose(fd)
     raise newException(OSError, "cannot bind " & $ip & ":" & $port)
   if listen(fd, 5) != 0:
-    discard posix.close(fd)
+    sockClose(fd)
     raise newException(OSError, "listen failed")
   fd

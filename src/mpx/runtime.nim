@@ -5,6 +5,8 @@
 ## exists but is not writable by apps and the Termux prefix tmp is the
 ## right place.
 ##
+## On Windows: %TEMP%, else %LOCALAPPDATA%\Temp.
+##
 ## Termux detection is runtime, not compile-time: Termux's own Nim
 ## identifies as plain linux, and the termux-docker CI container exports
 ## $PREFIX but not $TERMUX_VERSION. A $PREFIX ending in
@@ -22,14 +24,23 @@ proc isTermux*(): bool =
     result = prefix.len > 0 and prefix.endsWith("com.termux/files/usr")
 
 proc runtimeDir*(): string =
-  result = getEnv("XDG_RUNTIME_DIR")
-  if result.len == 0:
-    result = getEnv("TMPDIR")
-  if result.len == 0:
-    if isTermux():
-      result = getEnv("PREFIX", "/data/data/com.termux/files/usr") / "tmp"
-    else:
-      result = "/tmp"
+  when defined(windows):
+    result = getEnv("TEMP")
+    if result.len == 0:
+      let appdata = getEnv("LOCALAPPDATA")
+      if appdata.len > 0:
+        result = appdata / "Temp"
+    if result.len == 0:
+      result = "."
+  else:
+    result = getEnv("XDG_RUNTIME_DIR")
+    if result.len == 0:
+      result = getEnv("TMPDIR")
+    if result.len == 0:
+      if isTermux():
+        result = getEnv("PREFIX", "/data/data/com.termux/files/usr") / "tmp"
+      else:
+        result = "/tmp"
 
 proc mpxDir*(): string =
   result = runtimeDir() / "mpx"

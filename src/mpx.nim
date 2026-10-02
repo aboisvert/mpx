@@ -1,6 +1,9 @@
 import std/[os, posix, strutils, sequtils]
 import mpx/[daemon, client, protocol, session, cli, runtime]
 
+when defined(windows):
+  import mpx/win
+
 const
   Version = staticRead("../mpx.nimble").splitLines.filterIt(it.startsWith("version"))[0].split('=')[1].strip().strip(chars={' ', '"'})
 
@@ -53,6 +56,8 @@ proc cleanStale(sessionName: string) =
   die((if stale: "cleaned stale socket, no daemon for session: " else: "no such session: ") & sessionName)
 
 proc main() =
+  when defined(windows):
+    initWinsock()
   var opts: Opts
   try:
     opts = parseCliArgs(commandLineParams())
