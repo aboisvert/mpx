@@ -14,12 +14,15 @@ else:
 
 proc defaultName*(): string =
   ## Sessions started without a name are named after the current directory.
-  ## Homedir collapses to `~`.
-  let cwd = normalizedPath(getCurrentDir())
-  if cwd == normalizedPath(getHomeDir()):
-    "~"
-  else:
-    lastPathPart(cwd)
+  ## Homedir collapses to `~`. The check is stat-based, not lexical: on
+  ## macOS the same directory is reachable via /var and /private/var.
+  let cwd = getCurrentDir()
+  try:
+    if sameFile(cwd, getHomeDir()):
+      return "~"
+  except OSError:
+    discard  # no home to collapse into
+  lastPathPart(cwd)
 
 proc resolveSession*(name: string): string =
   ## Empty name defaults to the directory name, deconflicted with a counter:
