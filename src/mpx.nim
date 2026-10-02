@@ -154,13 +154,19 @@ proc main() =
         var si = STARTUPINFO()
         si.cb = int32(sizeof(STARTUPINFO))
         var pi = PROCESS_INFORMATION()
-        if createProcessW(newWideCString(exe),
-                          newWideCString(args.mapIt(quoteArg(it)).join(" ")),
-                          nil, nil, 0,
-                          DETACHED_PROCESS or CREATE_BREAKAWAY_FROM_JOB or
-                          CREATE_NEW_PROCESS_GROUP,
-                          nil, nil, si, pi) == 0:
-          die("CreateProcessW failed for daemon: " & $getLastError())
+        let cmdline = newWideCString(args.mapIt(quoteArg(it)).join(" "))
+        var flags = DETACHED_PROCESS or CREATE_BREAKAWAY_FROM_JOB or
+                    CREATE_NEW_PROCESS_GROUP
+        if createProcessW(newWideCString(exe), cmdline,
+                          nil, nil, 0, flags, nil, nil, si, pi) == 0:
+          # A job that denies breakaway (CI runners put steps in one)
+          # fails the combined call; without the flag the daemon is
+          # still console-free and in its own group, just not out of
+          # the job.
+          flags = flags and not CREATE_BREAKAWAY_FROM_JOB
+          if createProcessW(newWideCString(exe), cmdline,
+                            nil, nil, 0, flags, nil, nil, si, pi) == 0:
+            die("CreateProcessW failed for daemon: " & $getLastError())
         discard closeHandle(pi.hThread)
         # The daemon runs in the foreground forever; wait for its port
         # file, not for the process. A signaled handle catches an early

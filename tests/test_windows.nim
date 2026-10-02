@@ -27,8 +27,13 @@ proc runMpx(args: seq[string], chunks: seq[string] = @[],
   let p = startProcess(Bin, args = args, options = {poStdErrToStdOut})
   for c in chunks:
     sleep(500)
-    p.inputStream.write(c)
-    p.inputStream.flush()
+    try:
+      p.inputStream.write(c)
+      p.inputStream.flush()
+    except OSError, IOError:
+      # child died before reading stdin; the exitCode assert below
+      # carries its stderr
+      break
   if closeAfterMs > 0:
     sleep(closeAfterMs)
     p.inputStream.close()
