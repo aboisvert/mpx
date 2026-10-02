@@ -2,7 +2,7 @@
 #
 # Run with: nimble example
 
-import std/[os, osproc, strutils, posix, strtabs]
+import std/[os, osproc, strutils, posix, strtabs, streams]
 
 putEnv("XDG_RUNTIME_DIR", "/tmp")
 
@@ -21,6 +21,20 @@ proc cleanup() =
   removeFile(RuntimeDir / "mpx" / Session & ".sock")
   removeFile(RuntimeDir / "mpx" / "bashdemo.sock")
 
+proc runTimed(cmd: string, secs: int,
+              workingDir = ""): tuple[output: string, exitCode: int] =
+  ## GNU coreutils `timeout` is not on macOS; the deadline lives here.
+  ## A hang is killed, and grandchildren die on their own pipe EOFs.
+  let p = startProcess("/bin/sh", args = ["-c", cmd],
+                       workingDir = workingDir,
+                       options = {poStdErrToStdout})
+  discard p.waitForExit(secs * 1000)
+  if p.running:
+    p.kill()
+  result.output = p.outputStream.readAll()
+  result.exitCode = p.peekExitCode()
+  p.close()
+
 cleanup()
 
 # Start daemon in background, detached
@@ -38,12 +52,12 @@ doAssert sockExists(RuntimeDir / "mpx" / Session & ".sock"), "socket not created
 echo "example: daemon started, socket exists"
 
 # Attach a client, send input, capture output
-let (output, _) = execCmdEx("(echo 'hello from example'; sleep 1) | timeout 3 ./mpx attach " & Session)
+let (output, _) = runTimed("(echo 'hello from example'; sleep 1) | ./mpx attach " & Session, 3)
 doAssert "hello from example" in output, "expected echo in output, got: " & output
 echo "example: client attach and echo verified"
 
 # Verify snapshot on second attach (should contain previous output)
-let (snap, _) = execCmdEx("timeout 2 ./mpx attach " & Session & " < /dev/null")
+let (snap, _) = runTimed("./mpx attach " & Session & " < /dev/null", 2)
 doAssert "hello from example" in snap, "snapshot missing previous output: " & snap
 echo "example: snapshot on reattach verified"
 
@@ -61,7 +75,7 @@ for i in 1..40:
     break
   sleep(250)
 doAssert bashUp, "bashdemo daemon never started"
-let (bye, _) = execCmdEx("(echo 'exit'; sleep 1) | timeout 5 ./mpx attach bashdemo")
+let (bye, _) = runTimed("(echo 'exit'; sleep 1) | ./mpx attach bashdemo", 5)
 doAssert "exit" in bye, "expected echo of exit, got: " & bye
 var dead = false
 for i in 1..20:
@@ -139,8 +153,8 @@ let k9Pid = waitForSession(sigRt, "k9demo")
 discard posix.kill(k9Pid.Pid, SIGKILL)
 sleep(300)
 doAssert sockExists(sigRt / "mpx" / "k9demo.sock"), "SIGKILL should leave the socket"
-let (staleOut, staleCode) = execCmdEx("timeout 3 env XDG_RUNTIME_DIR=" & sigRt &
-                                      " " & bin & " attach k9demo < /dev/null 2>&1")
+let (staleOut, staleCode) = runTimed("env XDG_RUNTIME_DIR=" & sigRt &
+                                      " " & bin & " attach k9demo < /dev/null 2>&1", 3)
 doAssert staleCode != 0, "attach to a dead daemon should fail"
 doAssert "cleaned stale socket" in staleOut,
          "expected stale-socket cleanup message, got: " & staleOut
@@ -160,9 +174,8 @@ createDir(defDir)
 
 # The spawned daemon outlives the client and must not hold the output
 # pipe open: send its inherited stdio to /dev/null
-let (bareOut, bareRc) = execCmdEx("(sleep 1) | timeout 5 " & defEnv() & " " & bin &
-                                  " > /dev/null 2>&1",
-                                  workingDir = defDir)
+let (bareOut, bareRc) = runTimed("(sleep 1) | " & defEnv() & " " & bin &
+                                  " > /dev/null 2>&1", 5, defDir)
 doAssert bareRc == 0, "bare mpx failed: " & bareOut
 let (defLs, _) = execCmdEx(defEnv() & " " & bin & " l")
 doAssert "mpx_example_defdir" in defLs,
@@ -170,20 +183,20 @@ doAssert "mpx_example_defdir" in defLs,
 echo "example: bare mpx starts a session named after the cwd verified"
 
 # Seed the old session with distinctive output, then start a younger one
-let (seedOut, _) = execCmdEx("(echo 'echo OLDSESS'; sleep 1) | timeout 5 " &
-                            defEnv() & " " & bin & " at mpx_example_defdir")
+let (seedOut, _) = runTimed("(echo 'echo OLDSESS'; sleep 1) | " &
+                            defEnv() & " " & bin & " at mpx_example_defdir", 5)
 doAssert "OLDSESS" in seedOut, "could not seed the old session: " & seedOut
 discard startProcess(bin, args=["d", "youngdemo", "/bin/cat"],
                      env={"XDG_RUNTIME_DIR": defRt}.newStringTable,
                      options={poDaemon})
 discard waitForSession(defRt, "youngdemo")
-let (youngOut, _) = execCmdEx("(echo 'hello young'; sleep 1) | timeout 5 " &
-                             defEnv() & " " & bin & " at youngdemo")
+let (youngOut, _) = runTimed("(echo 'hello young'; sleep 1) | " &
+                             defEnv() & " " & bin & " at youngdemo", 5)
 doAssert "hello young" in youngOut, "prefix attach to youngdemo failed: " & youngOut
 
 # No-name attach lands on the older session: its scrollback, not the
 # younger session's, comes back in the snapshot
-let (oldestOut, _) = execCmdEx("(sleep 1) | timeout 5 " & defEnv() & " " & bin & " at")
+let (oldestOut, _) = runTimed("(sleep 1) | " & defEnv() & " " & bin & " at", 5)
 doAssert "OLDSESS" in oldestOut, "no-name attach missed the oldest session: " & oldestOut
 doAssert "hello young" notin oldestOut,
        "no-name attach went to the younger session: " & oldestOut
@@ -198,7 +211,7 @@ doAssert "youngdemo" notin afterKill and "mpx_example_defdir" notin afterKill
 echo "example: command prefixes verified"
 
 # No-name attach with nothing alive is a clean error
-let (noneOut, _) = execCmdEx("timeout 3 " & defEnv() & " " & bin & " at 2>&1")
+let (noneOut, _) = runTimed(defEnv() & " " & bin & " at 2>&1", 3)
 doAssert "no active sessions" in noneOut, "expected a clean no-sessions error: " & noneOut
 echo "example: attach with no live sessions errors cleanly verified"
 removeDir(defRt)
@@ -236,15 +249,15 @@ doAssert tcpUp, "daemon never logged its tcp listener"
 echo "example: -l flag enables tcp listener verified"
 
 # Attach with the session socket hidden from the client: goes over TCP
-let (tcpOut, _) = execCmdEx("(echo 'hello over tcp'; sleep 1) | timeout 3 env XDG_RUNTIME_DIR=" &
-                            clientRt & " " & bin & " attach tcpdemo -l 127.0.0.1:4590")
+let (tcpOut, _) = runTimed("(echo 'hello over tcp'; sleep 1) | env XDG_RUNTIME_DIR=" &
+                            clientRt & " " & bin & " attach tcpdemo -l 127.0.0.1:4590", 3)
 doAssert "hello over tcp" in tcpOut, "tcp attach failed, got: " & tcpOut
 echo "example: tcp attach by session name verified"
 
 # Wrong session name is rejected
-let (errOut, exitCode) = execCmdEx("(echo x; sleep 1) | timeout 3 env XDG_RUNTIME_DIR=" &
+let (errOut, exitCode) = runTimed("(echo x; sleep 1) | env XDG_RUNTIME_DIR=" &
                                    clientRt & " " & bin &
-                                   " attach nosuchsession -l 127.0.0.1:4590")
+                                   " attach nosuchsession -l 127.0.0.1:4590", 3)
 doAssert exitCode != 0, "wrong session name should fail, got: " & errOut
 echo "example: wrong session name rejected verified"
 
