@@ -19,6 +19,9 @@ when defined(windows):
     # (64) handles. The loop holds three fixed ones (stop, pty data,
     # listener) plus one per client.
     MaxClients = 56
+    # Double-buffer cap for pty output. The reader parks chunks here for
+    # the loop; when both are full the reader waits instead of dropping.
+    PtyBufCap = 256 * 1024
 
   type
     Spin = object
@@ -55,9 +58,14 @@ type
     when not defined(windows):
       sel: Selector[SocketHandle]
     else:
-      ptyOut: seq[byte]   # pty chunks parked by the reader thread
+      # The reader thread is a raw CreateThread (no Nim TLS), so it must
+      # not allocate: pty output lands in double fixed buffers the loop
+      # swaps under the spinlock, zero allocations on that thread.
+      ptyBufs: array[2, array[PtyBufCap, byte]]
+      ptyLen: array[2, int]
+      ptyActive: int
       ptyEof: Atomic[bool]  # the reader saw the console side go away
-      pspin: Spin          # guards ptyInq and ptyOut
+      pspin: Spin          # guards ptyInq and the pty buffers
       stopEv, dataEv, inEv: Handle
 
 when not defined(windows):
@@ -68,7 +76,12 @@ when not defined(windows):
   proc onShutdown(sig: cint) {.noconv.} =
     shutdownRequested.store(true, moRelaxed)
 
-proc newSession(name, cmd: string): Session =
+proc newSession*(name, cmd: string): Session =
+  ## Built from mpx.nim's main on purpose, never inside runDaemon: the
+  ## Windows ConPTY spawn in here must run at main's stack depth. One
+  ## frame deeper, inside runDaemon, the spawned child does not get
+  ## attached to the pseudoconsole on Win11 26100 in this mingw build.
+
   result.name = name
   result.pty = openPty(cmd)
   result.running = true
@@ -322,9 +335,19 @@ when defined(windows):
         s.ptyEof.store(true, moRelease)
         discard setEvent(s.dataEv)
         return 0
-      s.pspin.acquire()
-      s.ptyOut.add buf[0..<n]
-      s.pspin.release()
+      var off = 0
+      while off < n:
+        s.pspin.acquire()
+        let active = s.ptyActive
+        let room = PtyBufCap - s.ptyLen[active]
+        let take = min(room, n - off)
+        if take > 0:
+          copyMem(addr s.ptyBufs[active][s.ptyLen[active]], addr buf[off], take)
+          inc s.ptyLen[active], take
+        s.pspin.release()
+        if take == 0:
+          sleep(1)  # both buffers full: the loop drains them
+        inc off, take
       discard setEvent(s.dataEv)
 
   proc ptyWriterProc(param: pointer): DWORD {.stdcall, gcsafe.} =
@@ -352,7 +375,9 @@ when defined(windows):
           off += w
     return 0
 
-  proc runDaemon*(sessionName, cmd: string, cfg: Config) =
+  proc runDaemon*(sessionName, cmd: string, cfg: Config,
+                  session: Session) =
+    var session = session  # params are immutable; the loop mutates this
     let log = initLogger(cfg.log)
     log.info "daemon: session=" & sessionName & " cmd=" & cmd
     removeSocket(sessionName)
@@ -370,7 +395,6 @@ when defined(windows):
     log.info "listening on tcp " & $ip & ":" & $port
     log.info "listening on " & path
 
-    var session = newSession(sessionName, cmd)
     session.stopEv = createEvent(nil, 1, 0, nil)   # sticky: shutdown
     session.dataEv = createEvent(nil, 0, 0, nil)   # auto-reset: one drain per wake
     session.inEv = createEvent(nil, 0, 0, nil)     # auto-reset: one queue drain
@@ -406,11 +430,18 @@ when defined(windows):
         # PTY output. Drain before the eof check: the reader's last chunk
         # and its eof report can coalesce into one wake.
         session.pspin.acquire()
-        let chunk = move(session.ptyOut)
+        let taken = session.ptyActive
+        session.ptyActive = 1 - taken
+        let n = session.ptyLen[taken]
         session.pspin.release()
-        if chunk.len > 0:
-          session.term.write(cast[string](chunk))
-          session.broadcast(mkOutput, chunk)
+        if n > 0:
+          var chunk = newString(n)
+          copyMem(addr chunk[0], addr session.ptyBufs[taken][0], n)
+          session.term.write(chunk)
+          session.broadcast(mkOutput, toOpenArray(session.ptyBufs[taken], 0, n - 1))
+          session.pspin.acquire()
+          session.ptyLen[taken] = 0
+          session.pspin.release()
         if session.ptyEof.load(moAcquire):
           session.running = false
       elif idx == 2:
@@ -481,7 +512,9 @@ when defined(windows):
 
 else:
 
-  proc runDaemon*(sessionName, cmd: string, cfg: Config) =
+  proc runDaemon*(sessionName, cmd: string, cfg: Config,
+                  session: Session) =
+    var session = session  # params are immutable; the loop mutates this
     let log = initLogger(cfg.log)
     # A client that vanished mid-broadcast must cost us the client, not the
     # process: writes to its dead socket would raise SIGPIPE and take the
@@ -529,7 +562,6 @@ else:
       except ValueError, OSError:
         log.info "tcp listener disabled: " & getCurrentExceptionMsg()
 
-    var session = newSession(sessionName, cmd)
     # Everything the event loop touches is non-blocking: a single stalled
     # write (slow client, busy program) used to wedge the loop, freezing
     # the session for every client, including fresh attaches.

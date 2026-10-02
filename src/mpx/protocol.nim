@@ -200,8 +200,15 @@ proc listenTcp*(ip: IpAddress, port: int): SocketHandle =
   let fd = socket(AF_INET, SOCK_STREAM, 0)
   if fd == SocketHandle(-1):
     raise newException(OSError, "socket failed")
+  # Windows SO_REUSEADDR does not mean posix's "rebind after close": it
+  # silently lets a second daemon bind the same port, and connects then
+  # land on the wrong session's listener. SO_EXCLUSIVEADDRUSE is the
+  # actual "this port is mine" there.
   var one: cint = 1
-  discard setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, addr one, sizeof(one).SockLen)
+  when defined(windows):
+    discard setsockopt(fd, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, addr one, sizeof(one).SockLen)
+  else:
+    discard setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, addr one, sizeof(one).SockLen)
   var saddr: Sockaddr_in
   when defined(windows):
     saddr.sin_family = AF_INET

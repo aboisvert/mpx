@@ -161,6 +161,62 @@ commands drop their arguments (`mpx new sleep 30` execs a bare `sleep`,
 which dies, which fails the readiness poll); fix as a standalone
 commit or alongside step 7.
 
+## Beck VM runtime findings (step 6 addendum)
+
+Runtime testing on beck (Win11 26100, ssh as admin@beck, mingw
+cross-compile, binaries deployed with scp) drove the full flow end to
+end: `new cmd`, attach, live input/output roundtrip, detach, reattach
+with the snapshot intact, ls, kill, clean sweep. Getting there surfaced
+six bugs, all fixed and verified on the VM:
+
+1. `CreateProcessW` with a non-null lpApplicationName does not
+   PATH-search; a bare "cmd" failed with ERROR_FILE_NOT_FOUND. pty.nim
+   now passes nil and lets the command line carry the name, the same
+   deal execvp gives posix.
+2. A stack-allocated STARTUPINFOEXW made CreateProcessW fail with
+   ERROR_INVALID_PARAMETER (or silently drop the pseudoconsole
+   attribute) in this mingw build on Win11 26100, while heap or static
+   storage works and a plain C build with a stack struct works too.
+   pty.nim heap-allocates the struct.
+3. Without STARTF_USESTDHANDLES and invalid std handles (the shape
+   microsoft/terminal's own ConptyConnection uses), a child spawned by
+   a parent whose stdio is pipes instead of a console inherits those
+   redirected handles and never talks to the pseudoconsole. Symptom:
+   the shell's banner on the daemon's own stdout, an empty pipe.
+4. The ConPTY session must be built from mpx.nim's main, one frame
+   shallower than runDaemon; one frame deeper the spawned child again
+   misses the pseudoconsole, deterministically, on this VM. The
+   mechanism is unexplained (same depth as a passing checkpoint in the
+   same binary); the empirical rule is recorded in newSession's doc
+   comment.
+5. The daemon's pty reader thread ran Nim allocations (seq.add) on a
+   raw CreateThread that never initialized Nim TLS; the first output
+   chunk killed the process instantly and silently. The reader now uses
+   double fixed buffers swapped under the spinlock, zero allocations on
+   that thread.
+6. The client waited on the stdin handle directly in
+   WaitForMultipleObjects; an anonymous pipe in the array makes the
+   wait return "signaled" forever, so the loop parked in readFile and
+   never saw the socket. stdin now arrives on a reader thread (same
+   fixed-buffer discipline) and the loop waits on three events. Also,
+   the client must drain the socket once before the wait loop: FD_READ
+   is edge-set and misses bytes that land before the event select is
+   armed.
+
+Also fixed along the way: Windows SO_REUSEADDR lets a second daemon
+double-bind the same port (SO_EXCLUSIVEADDRUSE now), and the posix
+client's unselectable-stdin fallback loop never noticed EOF and hung
+forever on `attach < /dev/null` in this sandbox.
+
+Known wrinkles left open: stale .port files make isActive report other
+sessions as alive (connect success is not session identity; the CI
+windows tests in step 7 should cover this), and this sandbox's
+/dev/null does not support epoll, which is what exposed the EOF bug.
+
+Local re-verification after all fixes: posix build + nimble test
+(29 OK) + nimble example green; whole-binary `nim check --os:windows`
+clean; the beck flow listed above passes.
+
 ## Steps
 
 - [x] 1. **win.nim import layer.** Done. `src/mpx/win.nim` imports and
@@ -318,6 +374,10 @@ commit or alongside step 7.
   sweep); check --os:windows clean on client.nim and, for the first
   time, on src/mpx.nim as a whole. Windows runtime behavior of daemon
   and client both stays unexercised until step 7.
+  Post-script: runtime testing on the beck VM the same day (cross-
+  compiled here with x86_64-w64-mingw32-gcc, which turns out to be
+  installed despite the "no mingw" note above) found and fixed six real
+  Windows bugs; see the step 6 addendum in Current State.
 - [ ] 7. **Tests and example.** Read tests/test1.nim and example/
   example.nim first, then extend: windows branches exercise openPty +
   ConPTY roundtrip with the resolved shell and daemon-over-loopback at

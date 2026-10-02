@@ -147,8 +147,12 @@ else:
     # outRead is where its output lands; the other two ends belong to the
     # pseudoconsole after CreatePseudoConsole takes them.
     var inRead, inWrite, outRead, outWrite: Handle
+    # Inheritable, like portable-pty: conhost needs to take over these
+    # ends when CreatePseudoConsole hands them across. Our own copies of
+    # the consumed ends are closed right after, and the ends we keep are
+    # never passed to any other child, so inheritance is harmless here.
     var sa = SECURITY_ATTRIBUTES(nLength: int32(sizeof(SECURITY_ATTRIBUTES)),
-                                 bInheritHandle: 0)
+                                 bInheritHandle: 1)
     if createPipe(inRead, inWrite, sa, 0) == 0 or
         createPipe(outRead, outWrite, sa, 0) == 0:
       raise newException(OSError, "CreatePipe failed: " & $getLastError())
@@ -163,19 +167,34 @@ else:
       raise newException(OSError, "CreatePseudoConsole failed: " & $hr)
 
     # Attribute list carrying the pseudoconsole: this is how the child
-    # gets hooked to it instead of stdio handles.
-    var si = STARTUPINFOEXW()
-    si.StartupInfo.cb = int32(sizeof(STARTUPINFOEXW))
+    # gets hooked to it instead of stdio handles. si lives on the heap on
+    # purpose: as a stack local, CreateProcessW fails with
+    # ERROR_INVALID_PARAMETER in this mingw build on Win11 26100, while
+    # the same struct heap- or statically-allocated works there and a
+    # plain C build with a stack struct works too.
+    let si = cast[ptr STARTUPINFOEXW](alloc(sizeof(STARTUPINFOEXW)))
+    zeroMem(si, sizeof(STARTUPINFOEXW))
+    si[].StartupInfo.cb = int32(sizeof(STARTUPINFOEXW))
+    # STARTF_USESTDHANDLES with invalid handles, exactly like the
+    # pseudoconsole attach in microsoft/terminal's ConptyConnection:
+    # without it, a child spawned by a parent whose own stdio is
+    # redirected (pipes, not a console) inherits those redirected
+    # handles and never talks to the pseudoconsole at all. The
+    # pseudoconsole attribute replaces the invalid handles with the pty.
+    si[].StartupInfo.dwFlags = STARTF_USESTDHANDLES
+    si[].StartupInfo.hStdInput = INVALID_HANDLE_VALUE
+    si[].StartupInfo.hStdOutput = INVALID_HANDLE_VALUE
+    si[].StartupInfo.hStdError = INVALID_HANDLE_VALUE
     var attrSize: DWORD = 0
     discard InitializeProcThreadAttributeList(nil, 1, 0, addr attrSize)
     var attrBuf = newSeq[byte](attrSize.int)
-    si.lpAttributeList = cast[LPPROC_THREAD_ATTRIBUTE_LIST](addr attrBuf[0])
-    if InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, addr attrSize) == 0 or
-        UpdateProcThreadAttribute(si.lpAttributeList, 0,
+    si[].lpAttributeList = cast[LPPROC_THREAD_ATTRIBUTE_LIST](addr attrBuf[0])
+    if InitializeProcThreadAttributeList(si[].lpAttributeList, 1, 0, addr attrSize) == 0 or
+        UpdateProcThreadAttribute(si[].lpAttributeList, 0,
                                   PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
                                   cast[pointer](hpc), sizeof(HPCON).uint,
                                   nil, nil) == 0:
-      DeleteProcThreadAttributeList(si.lpAttributeList)
+      DeleteProcThreadAttributeList(si[].lpAttributeList)
       discard closeHandle(inWrite)
       discard closeHandle(outRead)
       ClosePseudoConsole(hpc)
@@ -187,16 +206,21 @@ else:
       cmdline.add ' '
       cmdline.add quoteArg(a)
     var pi = PROCESS_INFORMATION()
-    if createProcessW(newWideCString(exe), newWideCString(cmdline), nil, nil, 0,
+    # nil application name: CreateProcessW PATH-searches the first token of
+    # the command line, the same deal execvp gives a bare "cmd" on posix. A
+    # non-null lpApplicationName must be a real path; a bare name fails
+    # with ERROR_FILE_NOT_FOUND.
+    if createProcessW(nil, newWideCString(cmdline), nil, nil, 0,
                       EXTENDED_STARTUPINFO_PRESENT, nil, nil,
-                      si.StartupInfo, pi) == 0:
-      DeleteProcThreadAttributeList(si.lpAttributeList)
+                      si[].StartupInfo, pi) == 0:
+      DeleteProcThreadAttributeList(si[].lpAttributeList)
       discard closeHandle(inWrite)
       discard closeHandle(outRead)
       ClosePseudoConsole(hpc)
       raise newException(OSError, "CreateProcessW failed for " & exe & ": " &
         $getLastError())
-    DeleteProcThreadAttributeList(si.lpAttributeList)
+    DeleteProcThreadAttributeList(si[].lpAttributeList)
+    dealloc(si)
 
     result.hpc = hpc
     result.inWrite = inWrite

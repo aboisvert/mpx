@@ -120,7 +120,7 @@ proc main() =
   case mode
   of "daemon":
     try:
-      runDaemon(sessionName, cmd, cfg)
+      runDaemon(sessionName, cmd, cfg, newSession(sessionName, cmd))
     except CatchableError:
       die(getCurrentExceptionMsg())
   of "attach":
