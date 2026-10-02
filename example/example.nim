@@ -174,8 +174,10 @@ createDir(defDir)
 
 # The spawned daemon outlives the client and must not hold the output
 # pipe open: send its inherited stdio to /dev/null
+# stderr comes back to the capture so failures speak; stdout is
+# discarded to keep shell banners out of bareOut
 let (bareOut, bareRc) = runTimed("(sleep 1) | " & defEnv() & " " & bin &
-                                  " > /dev/null 2>&1", 5, defDir)
+                                  " 2>&1 > /dev/null", 5, defDir)
 doAssert bareRc == 0, "bare mpx failed: " & bareOut
 let (defLs, _) = execCmdEx(defEnv() & " " & bin & " l")
 doAssert "mpx_example_defdir" in defLs,
