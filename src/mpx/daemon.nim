@@ -1,15 +1,25 @@
-import std/[posix, os, strutils, selectors, atomics]
+import std/[posix, os, strutils, sequtils, selectors, atomics]
 import mpx/[pty, protocol, log, config]
 import ttty/[terminal, grid]
+
+const
+  # Cap on a client's pending output. A client that cannot drain (dead
+  # peer, stalled TCP link) gets dropped instead of growing the queue
+  # without bound. Snapshots are a few MB at worst and must fit.
+  OutqCap = 16 * 1024 * 1024
 
 type
   Client = object
     fd: SocketHandle
+    vetted: bool      # unix clients are trusted on arrival, TCP must name the session
+    outq: seq[byte]   # framed bytes the socket would not take yet
+    inbuf: seq[byte]  # partial frame(s) read off a non-blocking socket
 
   Session = object
     name: string
     pty: Pty
     clients: seq[Client]
+    ptyInq: seq[byte]  # input the pty buffer would not take yet
     running: bool
     term: Terminal  # ttty side cache for attach snapshots
 
@@ -26,11 +36,11 @@ proc newSession(name, cmd: string): Session =
   result.running = true
   result.term = newTerminal(80, 24, 10000)  # larger scrollback
 
-proc knownClient(session: Session, fd: SocketHandle): bool =
-  for c in session.clients:
+proc clientIndex(session: Session, fd: SocketHandle): int =
+  for i, c in session.clients:
     if c.fd == fd:
-      return true
-  false
+      return i
+  -1
 
 proc removeClient(session: var Session, fd: SocketHandle) =
   var i = 0
@@ -48,37 +58,92 @@ proc dropClient(session: var Session, sel: var Selector[SocketHandle], fd: Socke
     discard
   discard posix.close(fd)
 
-proc broadcast(session: var Session, kind: MsgKind, payload: openArray[byte]) =
+proc setInterest(sel: var Selector[SocketHandle], fd: SocketHandle,
+                  wantWrite: bool) =
+  # Write interest only while a queue is pending: an always-writable fd
+  # would make select spin.
+  var evs = {Event.Read}
+  if wantWrite:
+    evs.incl Event.Write
+  sel.updateHandle(fd, evs)
+
+proc flushClient(session: var Session, sel: var Selector[SocketHandle], i: int): bool =
+  ## Push queued frames until the socket is full. False: peer is gone.
+  let c = addr session.clients[i]
+  while c.outq.len > 0:
+    let w = posix.write(c.fd.cint, addr c.outq[0], c.outq.len)
+    if w > 0:
+      c.outq.delete(0 ..< w)
+    elif errno == EAGAIN or errno == EWOULDBLOCK:
+      break
+    else:
+      return false
+  setInterest(sel, c.fd, c.outq.len > 0)
+  result = true
+
+proc queueClient(session: var Session, sel: var Selector[SocketHandle],
+                 i: int, kind: MsgKind, payload: openArray[byte]): bool =
+  ## Frame and append to a client's queue, then send what fits now.
+  ## False: over cap or hard write error; caller drops the client.
+  let frame = frameBytes(kind, payload)
+  let c = addr session.clients[i]
+  if c.outq.len + frame.len > OutqCap:
+    return false
+  c.outq.add frame
+  result = session.flushClient(sel, i)
+
+proc broadcast(session: var Session, sel: var Selector[SocketHandle],
+               kind: MsgKind, payload: openArray[byte]) =
   var i = 0
   while i < session.clients.len:
-    let client = session.clients[i]
-    try:
-      if not sendMsg(client.fd, kind, payload):
-        raise newException(IOError, "short write to client fd=" & $client.fd.cint)
+    if not session.clients[i].vetted:
+      inc i  # a TCP client that has not named the session hears nothing
+    elif session.queueClient(sel, i, kind, payload):
       inc i
-    except IOError:
-      session.clients.delete(i)
+    else:
+      session.dropClient(sel, session.clients[i].fd)
 
-proc sendSnapshot(session: var Session, fd: SocketHandle) =
+proc queueSnapshot(session: var Session, sel: var Selector[SocketHandle], i: int) =
   ## Full-model render: scrollback as text, then the live screen with
   ## attributes, ending in clear+home so live output follows cleanly.
-  ## One payload, sent as a single mkOutput message.
+  ## One payload, queued as a single mkOutput frame.
   let snap = session.term.grid.renderAnsiFull()
   if snap.len > 0:
-    try:
-      if not sendMsg(fd, mkOutput, snap.toOpenArrayByte(0, snap.len-1)):
-        raise newException(IOError, "short write on snapshot to fd=" & $fd.cint)
-    except IOError:
-      discard
+    if not session.queueClient(sel, i, mkOutput, snap.toOpenArrayByte(0, snap.len-1)):
+      session.dropClient(sel, session.clients[i].fd)
 
-proc handleClientMsg(session: var Session, fd: SocketHandle, kind: MsgKind, payload: seq[byte]) =
-  if not knownClient(session, fd): return
+proc flushPty(session: var Session, sel: var Selector[SocketHandle]) =
+  ## Feed queued input to the pty. The program may stop reading (a build
+  ## spewing output, a stopped editor); blocking here would stall every
+  ## client, so the remainder waits for writability instead.
+  let fd = session.pty.masterFd.SocketHandle
+  while session.ptyInq.len > 0:
+    let w = posix.write(session.pty.masterFd, addr session.ptyInq[0],
+                        session.ptyInq.len)
+    if w > 0:
+      session.ptyInq.delete(0 ..< w)
+    elif errno == EAGAIN or errno == EWOULDBLOCK:
+      setInterest(sel, fd, true)
+      return
+    else:
+      discard  # EIO: child gone; the read side ends the session
+  setInterest(sel, fd, false)
 
+proc takeClientFrame(session: var Session, i: int,
+                     kind: var MsgKind, payload: var seq[byte]): bool =
+  takeFrame(session.clients[i].inbuf, kind, payload)
+
+proc handleClientMsg(session: var Session, sel: var Selector[SocketHandle],
+                     i: int, kind: MsgKind, payload: seq[byte]): bool =
+  ## Handle one parsed frame. False: the client must be dropped.
+  if not session.clients[i].vetted:
+    return true  # unvetted TCP clients only get mkAttach processed
   case kind
   of mkInput:
     # Primaryless: every attached client writes to the pty.
     if payload.len > 0:
-      discard session.pty.write(unsafeAddr payload[0], payload.len)
+      session.ptyInq.add payload
+      session.flushPty(sel)
   of mkResize:
     # Any client may resize; last one wins.
     if payload.len >= 4:
@@ -87,11 +152,12 @@ proc handleClientMsg(session: var Session, fd: SocketHandle, kind: MsgKind, payl
       session.pty.setSize(w, h)
       session.term.grid.resize(w.int, h.int)
       # Broadcast resize to all clients so they can adapt
-      session.broadcast(mkResize, payload)
+      session.broadcast(sel, mkResize, payload)
   of mkDetach:
-    discard
+    return false
   else:
     discard
+  result = true
 
 proc startTcpListener(sessionName: string, cfg: Config): (SocketHandle, int) =
   ## First free port at or above the configured base. Raises OSError when
@@ -108,6 +174,10 @@ proc startTcpListener(sessionName: string, cfg: Config): (SocketHandle, int) =
 
 proc runDaemon*(sessionName, cmd: string, cfg: Config) =
   let log = initLogger(cfg.log)
+  # A client that vanished mid-broadcast must cost us the client, not the
+  # process: writes to its dead socket would raise SIGPIPE and take the
+  # daemon, and the session with it.
+  discard signal(SIGPIPE, SIG_IGN)
   # SIGTERM/SIGINT/SIGHUP must run the cleanup below, not skip it: the
   # default disposition kills the daemon mid-flight and leaves socket,
   # pid, and lock files behind for attach to trip over.
@@ -150,6 +220,10 @@ proc runDaemon*(sessionName, cmd: string, cfg: Config) =
       log.info "tcp listener disabled: " & getCurrentExceptionMsg()
 
   var session = newSession(sessionName, cmd)
+  # Everything the event loop touches is non-blocking: a single stalled
+  # write (slow client, busy program) used to wedge the loop, freezing
+  # the session for every client, including fresh attaches.
+  setNonBlocking(session.pty.masterFd.SocketHandle)
   var sel = newSelector[SocketHandle]()
   sel.registerHandle(listenFd, {Event.Read}, listenFd)
   if tcpFd != SocketHandle(-1):
@@ -165,49 +239,85 @@ proc runDaemon*(sessionName, cmd: string, cfg: Config) =
         # New client on the unix socket: trusted, attach immediately
         let clientFd = accept(listenFd, nil, nil)
         if clientFd != SocketHandle(-1):
-          session.clients.add(Client(fd: clientFd))
+          setNonBlocking(clientFd)
+          session.clients.add(Client(fd: clientFd, vetted: true))
           sel.registerHandle(clientFd, {Event.Read}, clientFd)
-          session.sendSnapshot(clientFd)
+          session.queueSnapshot(sel, session.clients.len - 1)
           log.info "client attached fd=" & $clientFd.cint
       elif ev.fd == tcpFd.cint:
         # New TCP client: hold it until it names the right session
         let clientFd = accept(tcpFd, nil, nil)
         if clientFd != SocketHandle(-1):
+          setNonBlocking(clientFd)
+          session.clients.add(Client(fd: clientFd, vetted: false))
           sel.registerHandle(clientFd, {Event.Read}, clientFd)
       elif ev.fd == session.pty.masterFd:
-        # PTY output
-        var buf: array[4096, byte]
-        let n = session.pty.read(addr buf[0], buf.len)
-        if n > 0:
-          # Feed ttty side cache
-          session.term.write(cast[string](buf[0..<n]))
-          session.broadcast(mkOutput, buf[0..<n])
-        else:
-          # Child exited. Linux reports PTY EOF as EIO (-1), BSD as 0.
-          session.running = false
-          break
+        if Event.Write in ev.events:
+          session.flushPty(sel)
+        if (Event.Read in ev.events or Event.Error in ev.events) and
+            session.running:
+          # PTY output. The last slave fd closing surfaces as
+          # Event.Error (EPOLLHUP), not Read: the read below confirms it.
+          var buf: array[4096, byte]
+          let n = session.pty.read(addr buf[0], buf.len)
+          if n > 0:
+            # Feed ttty side cache
+            session.term.write(cast[string](buf[0..<n]))
+            session.broadcast(sel, mkOutput, buf[0..<n])
+          elif n == 0 or errno == EIO:
+            # Child exited. Linux reports PTY EOF as EIO (-1), BSD as 0.
+            # EAGAIN just means the readable edge was already drained.
+            session.running = false
+            break
       else:
-        # Client message
+        # Client socket: readable frames, writable queue
         let fd = ev.fd.SocketHandle
+        let i = session.clientIndex(fd)
+        if i < 0:
+          continue
+        var drop = false
         try:
-          let (kind, payload) = recvMsg(fd)
-          if kind == mkAttach and not knownClient(session, fd):
-            # Unvetted TCP client: check the session name
-            if payload == session.name.toOpenArrayByte(0, session.name.len-1):
-              session.clients.add(Client(fd: fd))
-              if not sendMsg(fd, mkAttached):
-                raise newException(IOError, "short write on mkAttached")
-              session.sendSnapshot(fd)
-              log.info "client attached fd=" & $fd.cint & " (tcp)"
+          if Event.Write in ev.events:
+            drop = not session.flushClient(sel, i)
+          if (Event.Read in ev.events or Event.Error in ev.events) and
+            not drop:
+            # Error on a client socket is a dead peer; the read says EOF
+            var buf: array[4096, byte]
+            let n = posix.read(fd.cint, addr buf[0], buf.len)
+            if n > 0:
+              session.clients[i].inbuf.add buf[0..<n]
+              var kind: MsgKind
+              var payload: seq[byte]
+              while not drop:
+                # Handling a frame can drop another client (dead peer in
+                # broadcast); indexes shift, so re-resolve ours every time
+                let ci = session.clientIndex(fd)
+                if ci < 0:
+                  drop = true
+                  break
+                if not session.takeClientFrame(ci, kind, payload):
+                  break
+                if kind == mkAttach and session.clients[ci].vetted.not:
+                  # Unvetted TCP client: check the session name
+                  if payload == session.name.toOpenArrayByte(0, session.name.len-1):
+                    session.clients[ci].vetted = true
+                    drop = not session.queueClient(sel, ci, mkAttached, [])
+                    if not drop:
+                      session.queueSnapshot(sel, ci)
+                      log.info "client attached fd=" & $fd.cint & " (tcp)"
+                  else:
+                    let err = "no such session"
+                    discard session.queueClient(sel, ci, mkError,
+                      err.toOpenArrayByte(0, err.len-1))
+                    drop = true
+                else:
+                  if not session.handleClientMsg(sel, ci, kind, payload):
+                    drop = true
             else:
-              let err = "no such session"
-              discard sendMsg(fd, mkError, err.toOpenArrayByte(0, err.len-1))
-              dropClient(session, sel, fd)
-          else:
-            session.handleClientMsg(fd, kind, payload)
-            if kind == mkDetach:
-              dropClient(session, sel, fd)
+              drop = true  # EOF
         except IOError:
+          drop = true
+        if drop:
           dropClient(session, sel, fd)
 
   # Cleanup

@@ -4,9 +4,27 @@ import mpx/[protocol, config, pty]
 # Not exported by Nim's posix: Linux, macOS, and the BSDs all use 28.
 const SIGWINCH = cint(28)
 
-var winchFd: cint = -1  # socket fd for the SIGWINCH handler
+# Self-pipe for SIGWINCH: the handler only pokes a byte (write to a pipe
+# is async-signal-safe); the resize frame itself is sent from the main
+# loop. Writing the socket from the handler interleaved a frame between
+# another frame's length prefix and payload, desyncing the daemon's
+# stream parse and freezing the session.
+var winchPipe: array[2, cint] = [cint(-1), cint(-1)]
+
+proc onWinch(sig: cint) {.noconv.} =
+  var b: byte = 1
+  discard posix.write(winchPipe[1], addr b, 1)
+
+proc sendResize(fd: SocketHandle) =
+  var ws: Winsize
+  discard ioctl(1, TIOCGWINSZ, addr ws)
+  if ws.ws_col > 0 and ws.ws_row > 0:
+    discard sendMsg(fd, mkResize,
+      [byte(ws.ws_col shr 8), byte(ws.ws_col and 0xff),
+       byte(ws.ws_row shr 8), byte(ws.ws_row and 0xff)])
 
 proc runClient*(sessionName: string, cfg: Config) =
+  discard signal(SIGPIPE, SIG_IGN)  # a closed peer is an error, not death
   let fd =
     try:
       connectUnix(socketPath(sessionName))
@@ -57,22 +75,18 @@ proc runClient*(sessionName: string, cfg: Config) =
     h = 24
   discard sendMsg(fd, mkResize, [byte(w shr 8), byte(w and 0xff), byte(h shr 8), byte(h and 0xff)])
 
-  # Closure capture of `fd` is not allowed in a noconv signal handler; the
-  # socket fd is a stable integer for the life of the attach, so the
-  # handler reads it through a file-scope var instead.
-  winchFd = fd.cint
-  var oldWinch: typeof(SIG_IGN)
-  proc onWinch(sig: cint) {.noconv.} =
-    var ws: Winsize
-    discard ioctl(1, TIOCGWINSZ, addr ws)
-    if ws.ws_col > 0 and ws.ws_row > 0 and winchFd >= 0:
-      discard sendMsg(winchFd.SocketHandle, mkResize,
-        [byte(ws.ws_col shr 8), byte(ws.ws_col and 0xff),
-         byte(ws.ws_row shr 8), byte(ws.ws_row and 0xff)])
-  oldWinch = signal(SIGWINCH, onWinch)
+  if pipe(winchPipe) != 0:
+    raise newException(OSError, "pipe failed")
+  # Both ends non-blocking: the handler must never block on a full pipe,
+  # and the drain loop must not block on an emptied one.
+  for i in {0, 1}:
+    let pfl = fcntl(winchPipe[i], F_GETFL)
+    discard fcntl(winchPipe[i], F_SETFL, pfl or O_NONBLOCK)
+  let oldWinch = signal(SIGWINCH, onWinch)
 
   var sel = newSelector[SocketHandle]()
   sel.registerHandle(fd, {Event.Read}, fd)
+  sel.registerHandle(winchPipe[0].SocketHandle, {Event.Read}, winchPipe[0].SocketHandle)
 
   # Try to register stdin; may fail if stdin is not selectable (e.g. /dev/null)
   var stdinRegistered = false
@@ -100,6 +114,12 @@ proc runClient*(sessionName: string, cfg: Config) =
             discard sendMsg(fd, mkInput, buf[0..<n])
         else:
           running = false
+      elif ev.fd == winchPipe[0]:
+        # SIGWINCH arrived: drain the poke and send the resize from here
+        var poke: array[64, byte]
+        while posix.read(winchPipe[0], addr poke[0], poke.len) > 0:
+          discard
+        sendResize(fd)
       elif ev.fd == fd.cint:
         # daemon -> stdout
         try:
@@ -126,6 +146,9 @@ proc runClient*(sessionName: string, cfg: Config) =
 
   # Restore terminal
   discard signal(SIGWINCH, oldWinch)
-  winchFd = -1
+  if winchPipe[0] != -1:
+    discard posix.close(winchPipe[0])
+    discard posix.close(winchPipe[1])
+    winchPipe = [cint(-1), cint(-1)]
   discard tcsetattr(0, TCSADRAIN, addr oldTermios)
   discard posix.close(fd)

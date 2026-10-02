@@ -1,4 +1,4 @@
-import std/[posix, os, strutils]
+import std/[posix, os, strutils, sequtils]
 from std/net import parseIpAddress, IpAddress, IpAddressFamily
 import runtime
 
@@ -19,24 +19,46 @@ const
   ProtocolVersion = 2'u8
   HeaderSize = 6
 
+  # Attach snapshots (scrollback with attributes) are the largest real
+  # frames: a few MB at 10000 lines. Anything past this is a desynced or
+  # hostile peer, and reading it would pin the loop forever.
+  MaxPayload = 0xFFFFFF
+
+proc frameBytes*(kind: MsgKind, payload: openArray[byte]): seq[byte] =
+  ## Serialized frame: version, kind, 32-bit big-endian length, payload.
+  if payload.len > MaxPayload:
+    raise newException(IOError, "payload too large: " & $payload.len)
+  result = newSeq[byte](HeaderSize + payload.len)
+  result[0] = ProtocolVersion
+  result[1] = kind.byte
+  let n = payload.len.uint32
+  result[2] = byte(n shr 24)
+  result[3] = byte(n shr 16)
+  result[4] = byte(n shr 8)
+  result[5] = byte(n)
+  if payload.len > 0:
+    copyMem(addr result[HeaderSize], unsafeAddr payload[0], payload.len)
+
 proc sendMsg*(fd: SocketHandle, kind: MsgKind,
              payload: openArray[byte] = []): bool =
-  ## Write one framed message. Returns false when the write came up short
-  ## (the peer is gone); callers decide whether that is fatal.
-  if payload.len > 0xFFFFFFF:
+  ## Write one framed message, one write call per frame: a frame split
+  ## across two writes can be interleaved with another writer on the
+  ## same fd, and the peer would read the length prefix out of sync.
+  ## Short writes (interrupted after partial transfer) are retried.
+  ## Returns false on a hard error (peer gone).
+  if payload.len > MaxPayload:
     return false
-  var header: array[HeaderSize, byte]
-  header[0] = ProtocolVersion
-  header[1] = kind.byte
-  let n = payload.len.uint32
-  header[2] = byte(n shr 24)
-  header[3] = byte(n shr 16)
-  header[4] = byte(n shr 8)
-  header[5] = byte(n)
-  result = posix.write(fd.cint, addr header[0], HeaderSize) == HeaderSize
-  if payload.len > 0:
-    result = posix.write(fd.cint, unsafeAddr payload[0],
-                         payload.len) == payload.len
+  var buf = frameBytes(kind, payload)
+  var sent = 0
+  while sent < buf.len:
+    let w = posix.write(fd.cint, addr buf[sent], buf.len - sent)
+    if w > 0:
+      inc(sent, w)
+    elif errno == EINTR:
+      continue
+    else:
+      return false
+  result = true
 
 proc readFull*(fd: SocketHandle, buf: pointer, n: int): bool =
   ## Read exactly n bytes. False on EOF or error before n bytes arrived.
@@ -48,6 +70,30 @@ proc readFull*(fd: SocketHandle, buf: pointer, n: int): bool =
     inc(got, r)
   true
 
+proc takeFrame*(buf: var seq[byte], kind: var MsgKind,
+                payload: var seq[byte]): bool =
+  ## Pop one complete frame off the front of buf. False when buf holds
+  ## less than a full frame. Raises IOError on a malformed header: the
+  ## buffer is desynced and the peer must go.
+  if buf.len < HeaderSize:
+    return false
+  if buf[0] != ProtocolVersion:
+    raise newException(IOError, "protocol version mismatch")
+  let plen = (buf[2].int shl 24) or (buf[3].int shl 16) or
+             (buf[4].int shl 8) or buf[5].int
+  if plen > MaxPayload:
+    raise newException(IOError, "frame too large: " & $plen & " bytes")
+  if buf.len < HeaderSize + plen:
+    return false
+  kind = buf[1].MsgKind
+  payload = buf[HeaderSize ..< HeaderSize + plen]
+  buf.delete(0 ..< HeaderSize + plen)
+  result = true
+
+proc setNonBlocking*(fd: SocketHandle) =
+  let fl = fcntl(fd.cint, F_GETFL)
+  discard fcntl(fd.cint, F_SETFL, fl or O_NONBLOCK)
+
 proc recvMsg*(fd: SocketHandle): tuple[kind: MsgKind, payload: seq[byte]] =
   var header: array[HeaderSize, byte]
   if not readFull(fd, addr header[0], HeaderSize):
@@ -57,6 +103,8 @@ proc recvMsg*(fd: SocketHandle): tuple[kind: MsgKind, payload: seq[byte]] =
   result.kind = header[1].MsgKind
   let plen = (header[2].int shl 24) or (header[3].int shl 16) or
              (header[4].int shl 8) or header[5].int
+  if plen > MaxPayload:
+    raise newException(IOError, "frame too large: " & $plen & " bytes")
   if plen > 0:
     result.payload.setLen(plen)
     if not readFull(fd, addr result.payload[0], plen):
