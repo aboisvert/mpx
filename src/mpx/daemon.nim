@@ -12,6 +12,8 @@ type
   Client = object
     fd: SocketHandle
     vetted: bool      # unix clients are trusted on arrival, TCP must name the session
+    snapshotPending: bool  # no frame sent yet: wait for the client's resize so
+                           # the snapshot renders at the client's geometry
     outq: seq[byte]   # framed bytes the socket would not take yet
     inbuf: seq[byte]  # partial frame(s) read off a non-blocking socket
 
@@ -96,8 +98,9 @@ proc broadcast(session: var Session, sel: var Selector[SocketHandle],
                kind: MsgKind, payload: openArray[byte]) =
   var i = 0
   while i < session.clients.len:
-    if not session.clients[i].vetted:
-      inc i  # a TCP client that has not named the session hears nothing
+    if not session.clients[i].vetted or session.clients[i].snapshotPending:
+      inc i  # unvetted TCP clients hear nothing; a pre-snapshot client is
+             # about to receive the whole modeled screen instead
     elif session.queueClient(sel, i, kind, payload):
       inc i
     else:
@@ -105,11 +108,17 @@ proc broadcast(session: var Session, sel: var Selector[SocketHandle],
 
 proc queueSnapshot(session: var Session, sel: var Selector[SocketHandle], i: int) =
   ## Full-model render: scrollback as text, then the live screen with
-  ## attributes, ending in clear+home so live output follows cleanly.
-  ## One payload, queued as a single mkOutput frame.
-  let snap = session.term.grid.renderAnsiFull()
+  ## attributes. Ends by moving the terminal cursor to the cell the
+  ## session's program thinks it occupies: programs keep drawing with
+  ## relative cursor moves after the attach, and a cursor left at the
+  ## bottom row would smear that output across the screen.
+  let g = session.term.grid
+  let snap = g.renderAnsiFull()
   if snap.len > 0:
-    if not session.queueClient(sel, i, mkOutput, snap.toOpenArrayByte(0, snap.len-1)):
+    let first = max(0, g.rows.len - g.height)
+    let r = max(0, g.row - first)
+    var frame = snap & "\x1b[" & $(r + 1) & ";" & $(g.col + 1) & "H"
+    if not session.queueClient(sel, i, mkOutput, frame.toOpenArrayByte(0, frame.len-1)):
       session.dropClient(sel, session.clients[i].fd)
 
 proc flushPty(session: var Session, sel: var Selector[SocketHandle]) =
@@ -151,6 +160,13 @@ proc handleClientMsg(session: var Session, sel: var Selector[SocketHandle],
       let h = (payload[2].uint16 shl 8) or payload[3].uint16
       session.pty.setSize(w, h)
       session.term.grid.resize(w.int, h.int)
+      # First frame to a fresh client renders at its geometry: resized
+      # grid first, then the snapshot. Rendered before the resize, a
+      # taller grid than the client pushes all content off the top of
+      # its screen, leaving a blank screen with the cursor at the bottom.
+      if session.clients[i].snapshotPending:
+        session.clients[i].snapshotPending = false
+        session.queueSnapshot(sel, i)
       # Broadcast resize to all clients so they can adapt
       session.broadcast(sel, mkResize, payload)
   of mkDetach:
@@ -240,9 +256,8 @@ proc runDaemon*(sessionName, cmd: string, cfg: Config) =
         let clientFd = accept(listenFd, nil, nil)
         if clientFd != SocketHandle(-1):
           setNonBlocking(clientFd)
-          session.clients.add(Client(fd: clientFd, vetted: true))
+          session.clients.add(Client(fd: clientFd, vetted: true, snapshotPending: true))
           sel.registerHandle(clientFd, {Event.Read}, clientFd)
-          session.queueSnapshot(sel, session.clients.len - 1)
           log.info "client attached fd=" & $clientFd.cint
       elif ev.fd == tcpFd.cint:
         # New TCP client: hold it until it names the right session
@@ -303,7 +318,7 @@ proc runDaemon*(sessionName, cmd: string, cfg: Config) =
                     session.clients[ci].vetted = true
                     drop = not session.queueClient(sel, ci, mkAttached, [])
                     if not drop:
-                      session.queueSnapshot(sel, ci)
+                      session.clients[ci].snapshotPending = true
                       log.info "client attached fd=" & $fd.cint & " (tcp)"
                   else:
                     let err = "no such session"
