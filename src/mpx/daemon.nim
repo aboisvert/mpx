@@ -83,7 +83,8 @@ proc newSession*(name, cmd: string): Session =
   ## attached to the pseudoconsole on Win11 26100 in this mingw build.
 
   result.name = name
-  result.pty = openPty(cmd)
+  # Pass the resolved session name so the PTY child exports MPX_SESSION.
+  result.pty = openPty(cmd, sessionName = name)
   result.running = true
   result.term = newTerminal(80, 24, 10000)  # larger scrollback
 

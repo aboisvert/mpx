@@ -15,6 +15,7 @@ import mpx/runtime
 
 const Session = "winsmoke"
 const Shell = "winshell"
+const EnvSession = "winenv"
 
 let Bin = "mpx.exe"
 
@@ -46,7 +47,7 @@ proc runMpx(args: seq[string], chunks: seq[string] = @[],
 
 # Sweep leftovers from a previous run; kill of a dead session is
 # expected to die (stale-file cleanup), the exit code is ignored
-for s in [Session, Shell]:
+for s in [Session, Shell, EnvSession]:
   discard runMpx(@["kill", s], secs = 15)
 
 # new cmd: daemon spawns detached, client attaches, `echo zkmark`
@@ -58,6 +59,14 @@ doAssert first.exitCode == 0,
 doAssert "zkmark" in first.output,
   "expected zkmark roundtripped through the pty: " & first.output
 echo "test: new cmd, live roundtrip, Ctrl-G detach verified"
+
+let envOut = runMpx(@["new", EnvSession, "cmd /c echo %MPX_SESSION%"],
+                    closeAfterMs = 1500)
+doAssert envOut.exitCode == 0,
+  "MPX_SESSION roundtrip failed (" & $envOut.exitCode & "): " & envOut.output
+doAssert EnvSession in envOut.output,
+  "expected MPX_SESSION echoed in pty output: " & envOut.output
+echo "test: MPX_SESSION in pty child verified"
 
 # Reattach: the snapshot carries the previous output; stdin EOF with
 # no input ends the client
@@ -75,12 +84,13 @@ echo "test: default-shell session verified"
 
 # ls lists both sessions
 let lsOut = runMpx(@["ls"], secs = 15)
-doAssert Session in lsOut.output and Shell in lsOut.output,
+doAssert Session in lsOut.output and Shell in lsOut.output and
+  EnvSession in lsOut.output,
   "ls missing sessions: " & lsOut.output
 echo "test: ls lists both sessions"
 
 # kill sweeps processes and files
-for s in [Session, Shell]:
+for s in [Session, Shell, EnvSession]:
   let k = runMpx(@["kill", s], secs = 20)
   doAssert k.exitCode == 0, "kill " & s & " failed: " & k.output
   doAssert not fileExists(mpxDir() / (s & ".port")),

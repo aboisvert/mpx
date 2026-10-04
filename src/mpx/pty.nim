@@ -1,7 +1,10 @@
-import std/os
+# Aliased so envPairs/findExe stay qualified: posix and os both expose
+# putEnv and the fork child must use libc setenv instead.
+import std/os as os
 
 when defined(windows):
   import mpx/win
+  import std/unicode
 else:
   import std/posix
 
@@ -10,12 +13,12 @@ proc defaultShell*(): string =
   ## $SHELL; Windows has no such convention, so probe the usual suspects.
   when defined(windows):
     for exe in ["pwsh.exe", "powershell.exe"]:
-      let found = findExe(exe)
+      let found = os.findExe(exe)
       if found.len > 0:
         return found
     result = "cmd.exe"
   else:
-    result = getEnv("SHELL", "/bin/sh")
+    result = os.getEnv("SHELL", "/bin/sh")
 
 when not defined(windows):
   # Manual declarations for openpty and winsize (not in Nim's posix module)
@@ -38,6 +41,9 @@ when not defined(windows):
   proc ioctl(fd: cint, request: culong, arg: pointer): cint
     {.importc, header: "<sys/ioctl.h>".}
 
+  proc setenv(name, value: cstring, overwrite: cint): cint
+    {.importc, header: "<stdlib.h>".}  # PTY child only; see MPX_SESSION below
+
   when defined(macosx) or defined(macos):
     const TIOCSCTTY = 0x20007461'u32  # _IOW('t', 132) on BSD/macOS
   else:
@@ -51,7 +57,8 @@ when not defined(windows):
       masterFd*: cint
       childPid*: Pid
 
-  proc openPty*(cmd: string, args: openArray[string] = [], width: uint16 = 80, height: uint16 = 24): Pty =
+  proc openPty*(cmd: string, args: openArray[string] = [], width: uint16 = 80, height: uint16 = 24, sessionName: string = ""): Pty =
+    ## sessionName sets MPX_SESSION in the spawned program when non-empty.
     let exe = if cmd.len == 0: defaultShell() else: cmd
     var master, slave: cint
     var win: Winsize
@@ -75,6 +82,10 @@ when not defined(windows):
         discard close(slave)
       discard close(master)
 
+      # Resolved mpx session name for scripts inside the PTY; set here in
+      # the fork child so the daemon's own environment stays untouched.
+      if sessionName.len > 0:
+        discard setenv("MPX_SESSION", sessionName.cstring, 1)
       let argv = allocCStringArray(@[exe] & @args)
       discard execvp(exe.cstring, argv)
       deallocCStringArray(argv)
@@ -137,7 +148,30 @@ else:
       result.add c
     result.add '"'
 
-  proc openPty*(cmd: string, args: openArray[string] = [], width: uint16 = 80, height: uint16 = 24): Pty =
+  # Programs in the session read this to learn which mpx session they are in.
+  const MpxSessionKey = "MPX_SESSION"
+
+  proc windowsEnvBlock(sessionName: string): seq[Wchar] =
+    ## Double-null-terminated UTF-16 block for CreateProcessW. We cannot
+    ## putEnv in the daemon: it would leak MPX_SESSION into every later
+    ## spawn. Copy the current environment and replace any existing key.
+    var envStr = ""
+    for key, val in os.envPairs():
+      if key == MpxSessionKey:
+        continue
+      envStr.add key
+      envStr.add '='
+      envStr.add val
+      envStr.add '\0'
+    envStr.add MpxSessionKey
+    envStr.add '='
+    envStr.add sessionName
+    envStr.add '\0'
+    envStr.add '\0'
+    toUtf16(envStr)
+
+  proc openPty*(cmd: string, args: openArray[string] = [], width: uint16 = 80, height: uint16 = 24, sessionName: string = ""): Pty =
+    ## sessionName sets MPX_SESSION in the spawned program when non-empty.
     let exe = if cmd.len == 0: defaultShell() else: cmd
     var size: COORD
     size.x = width.SHORT
@@ -206,12 +240,20 @@ else:
       cmdline.add ' '
       cmdline.add quoteArg(a)
     var pi = PROCESS_INFORMATION()
+    var envBlock: seq[Wchar]
+    var createFlags = EXTENDED_STARTUPINFO_PRESENT
+    var lpEnv: pointer = nil
+    if sessionName.len > 0:
+      envBlock = windowsEnvBlock(sessionName)
+      lpEnv = cast[pointer](addr envBlock[0])
+      # Required whenever lpEnvironment is a wide-character block.
+      createFlags = createFlags or CREATE_UNICODE_ENVIRONMENT
     # nil application name: CreateProcessW PATH-searches the first token of
     # the command line, the same deal execvp gives a bare "cmd" on posix. A
     # non-null lpApplicationName must be a real path; a bare name fails
     # with ERROR_FILE_NOT_FOUND.
     if createProcessW(nil, newWideCString(cmdline), nil, nil, 0,
-                      EXTENDED_STARTUPINFO_PRESENT, nil, nil,
+                      createFlags, lpEnv, nil,
                       si[].StartupInfo, pi) == 0:
       DeleteProcThreadAttributeList(si[].lpAttributeList)
       discard closeHandle(inWrite)

@@ -199,6 +199,16 @@ test "isActive false for missing socket":
   check not isActive("definitely_not_a_session_xyz")
 
 # PTY tests
+test "pty sets MPX_SESSION":
+  let p = openPty("/bin/sh", @["-c", "printf '%s' \"$MPX_SESSION\""],
+                  sessionName = "envtest")
+  sleep(50)
+  var buf: array[256, char]
+  let n = p.read(addr buf, buf.len)
+  check n > 0
+  check cast[string](buf[0..<n]) == "envtest"
+  p.close()
+
 test "pty roundtrip":
   let p = openPty("/bin/cat", [], 80, 24)
   let msg = "hello\n"
